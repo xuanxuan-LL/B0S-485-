@@ -8,6 +8,9 @@
 # 2) buildozer 1.6.0 的 android.accept_licenses=True 不会自动接受 build-tools 的许可，
 #    sdkmanager 装包时仍弹 "Accept? (y/N)" 并跳过 → SDK 不全、出不了 APK。故显式 yes | sdkmanager --licenses。
 # 3) buildozer ... | tee 的管道退出码是 tee 的(恒 0)，会掩盖失败。故用 set -o pipefail，且上传 if: success()。
+# 4) 固定 p4a 到新版本后，其自带 AGP 8.x + Gradle 8.14.3 必须用 Java 17 运行；
+#    但 ubuntu-22.04 runner 默认 java 是 temurin-11，故显式把 JAVA_HOME 指到 Java 17，
+#    并写进 PATH，否则 gradle daemon 起不来 (报错 "Android Gradle plugin requires Java 17")。
 name: Build Android APK
 
 on:
@@ -36,8 +39,14 @@ jobs:
             autoconf libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev \
             ccache
-          # 让 buildozer 找到 JDK
-          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))" >> "$GITHUB_ENV"
+          # AGP 8.x / Gradle 8 必须用 Java 17 运行；强制把 JAVA_HOME 指到 Java 17
+          # (优先 apt 装的 openjdk-17，回退到 runner 自带的 temurin-17)，并写进 PATH
+          JVM=$(ls -d /usr/lib/jvm/java-17-openjdk* 2>/dev/null | head -1)
+          [ -z "$JVM" ] && JVM=$(ls -d /usr/lib/jvm/temurin-17* 2>/dev/null | head -1)
+          echo "Resolved JAVA17_HOME=$JVM"
+          echo "JAVA_HOME=$JVM" >> "$GITHUB_ENV"
+          echo "$JVM/bin" >> "$GITHUB_PATH"
+          java -version
 
       - name: Install Buildozer
         run: |
