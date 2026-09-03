@@ -1,7 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- 合并进 APK 主 Activity / Manifest 的片段（Buildozer 读取后注入） -->
-<intent-filters>
-    <!-- 声明 USB 主机能力（不强制要求，绝大多数手机自带） -->
+    <!-- 声明 USB 主机能力（不强制，绝大多数手机自带） -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <!-- 监听 USB 设备插入，触发系统授权弹窗 -->
@@ -9,8 +6,7 @@
         <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
     </intent-filter>
 
-    <!-- 授权弹窗用的设备白名单，指向 res/xml/device_filter.xml -->
+    <!-- 授权弹窗设备白名单，指向 res/xml/device_filter.xml -->
     <meta-data
         android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
         android:resource="@xml/device_filter" />
-</intent-filters>
