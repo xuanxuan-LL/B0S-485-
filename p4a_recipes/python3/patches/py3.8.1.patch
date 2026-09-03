@@ -16,15 +16,6 @@ index 97973bc..053c231 100644
  elif os.name == "posix" and sys.platform == "darwin":
      from ctypes.macholib.dyld import dyld_find as _dyld_find
      def find_library(name):
-diff --git a/configure b/configure
-index 0914e24..dd00812 100755
---- a/configure
-+++ b/configure
-@@ -18673,4 +18673,3 @@ if test "$Py_OPT" = 'false' -a "$Py_DEBUG" != 'true'; then
-     echo "" >&6
-     echo "" >&6
- fi
--
 diff --git a/setup.py b/setup.py
 index 20d7f35..af15cc2 100644
 --- a/setup.py

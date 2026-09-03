@@ -67,8 +67,11 @@ android.enable_androidx = True
 
 # 自定义 p4a recipe：修复 CPython 3.10 在 NDK r25b 下 grp/crypt 编译失败
 p4a.local_recipes = p4a_recipes
-# p4a 分支保持默认 master（local_recipes 已覆盖 python3 recipe 修复编译）
-# p4a.branch = develop
+# 固定 p4a 到已知可用 commit，避免 master 漂移导致 recipe / 基础补丁不匹配
+# （之前每次构建 git clone 最新 master，某次 master 移除了 fix_ensurepip.patch
+#   等文件，本地覆盖 recipe 引用它们时直接报 “patch not found”）。
+p4a.branch = master
+p4a.commit = 58d21141f17c889bf8585f5665921d72028f8831
 
 [buildozer]
 log_level = 2
