@@ -65,7 +65,9 @@ android.enable_androidx = True
 # android.keystore = ./mctc.keystore
 # android.keyalias = mctc
 
-# p4a 分支：默认即可；遇到 "recipe 不认识 kivy==x" 时可改成 develop
+# 自定义 p4a recipe：修复 CPython 3.10 在 NDK r25b 下 grp/crypt 编译失败
+p4a.local_recipes = p4a_recipes
+# p4a 分支保持默认 master（local_recipes 已覆盖 python3 recipe 修复编译）
 # p4a.branch = develop
 
 [buildozer]
