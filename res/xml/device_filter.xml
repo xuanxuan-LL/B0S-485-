@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB 设备白名单：手机插入这些设备时弹出授权框，本 App 才会响应 -->
+<resources>
+    <!-- 通信类(CDC/ACM)：覆盖 PL2303 / CP210x / CH340 等标准串口 -->
+    <usb-device class="2" subclass="0" protocol="0" />
+
+    <!-- FTDI FT232/FT245 (VID 0x0403 = 1027, PID 0x6001 = 24577) -->
+    <usb-device vendor-id="1027" product-id="24577" />
+    <!-- FTDI FT230X/FT231X (PID 0x6015 = 24661) -->
+    <usb-device vendor-id="1027" product-id="24661" />
+
+    <!-- Silicon Labs CP210x (VID 0x10C4 = 4292, PID 0xEA60 = 60000) -->
+    <usb-device vendor-id="4292" product-id="60000" />
+
+    <!-- QinHeng CH340 (VID 0x1A86 = 6790, PID 0x7523 = 29987) -->
+    <usb-device vendor-id="6790" product-id="29987" />
+    <!-- QinHeng CH341 (PID 0x5523 = 21795) -->
+    <usb-device vendor-id="6790" product-id="21795" />
+
+    <!-- Prolific PL2303 (VID 0x067B = 1659, PID 0x2303 = 8963) -->
+    <usb-device vendor-id="1659" product-id="8963" />
+</resources>

@@ -1,0 +1,32 @@
+# GitHub Actions 云构建 APK（本机无需安卓 SDK / Java / WSL）
+# 触发方式:  push 标签 v*  或  在 Actions 页面点 "Run workflow"
+# 产物:      Artifacts 里的 mctc-apk（*arm64-v8a-debug.apk）
+name: Build Android APK
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 本项目在仓库子目录 MCTC_Android 下；
+      # 若单独建仓库且 main.py / buildozer.spec 在根目录，把 workdir 改成 .
+      - name: Build APK with Buildozer
+        id: buildozer
+        uses: ArtemSBulgakov/buildozer-action@v1
+        with:
+          workdir: MCTC_Android
+          buildozer_version: stable
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: mctc-apk
+          path: ${{ steps.buildozer.outputs.filename }}
+          if-no-files-found: error

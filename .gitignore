@@ -1,0 +1,22 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# ---- Buildozer / Kivy 构建产物 ----
+.buildozer/
+bin/
+build/
+*.apk
+*.aab
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 日志 / 临时 ----
+*.log
+/tmp/

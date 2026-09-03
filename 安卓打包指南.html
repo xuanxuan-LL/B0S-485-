@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCTC-KZ-B0S 测试方案 · 安卓 APP 与 APK 打包指南</title>
+<style>
+  :root{
+    --blue:#1a4f8a; --blue-l:#eaf1fa; --blue-b:#c7dcf3;
+    --green:#0a7d28; --green-l:#e8f6ec;
+    --red:#c00000; --red-l:#fdeaea;
+    --amber:#a35b00; --amber-l:#fff5e6;
+    --ink:#1f2430; --ink2:#4a5261; --line:#dfe4ec; --bg:#f6f8fb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:"Microsoft YaHei","PingFang SC","Helvetica Neue",Arial,sans-serif;
+       line-height:1.7;font-size:15px}
+  .wrap{max-width:1000px;margin:0 auto;padding:32px 26px 64px}
+  header{background:linear-gradient(135deg,#1a4f8a,#2f6fb5);color:#fff;
+         border-radius:12px;padding:26px 30px;margin-bottom:26px}
+  header h1{margin:0 0 6px;font-size:26px;letter-spacing:.5px}
+  header p{margin:0;opacity:.9;font-size:14px}
+  h2{font-size:20px;margin:34px 0 12px;padding-left:12px;
+     border-left:5px solid var(--blue);color:var(--blue)}
+  h3{font-size:16px;margin:22px 0 8px;color:var(--ink)}
+  .card{background:#fff;border:1px solid var(--line);border-radius:10px;
+        padding:18px 20px;margin:14px 0}
+  .verdict{background:var(--green-l);border:1px solid #b8e2c4;border-radius:10px;
+           padding:16px 20px;margin:16px 0}
+  .verdict b{color:var(--green)}
+  .warn{background:var(--amber-l);border:1px solid #f0d6ab;border-radius:10px;
+        padding:14px 18px;margin:14px 0}
+  .warn b{color:var(--amber)}
+  .bad{background:var(--red-l);border:1px solid #f0bcbc;border-radius:10px;
+       padding:14px 18px;margin:14px 0}
+  .bad b{color:var(--red)}
+  table{width:100%;border-collapse:collapse;background:#fff;
+        border:1px solid var(--line);border-radius:8px;overflow:hidden;margin:12px 0}
+  th{background:var(--blue-l);color:var(--blue);text-align:left;
+     padding:10px 12px;font-size:14px;border-bottom:1px solid var(--blue-b)}
+  td{padding:9px 12px;border-bottom:1px solid #eef1f6;font-size:14px;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  code{background:#eef1f6;padding:1px 6px;border-radius:4px;
+       font-family:Consolas,"Courier New",monospace;font-size:13px;color:#0b3a66}
+  pre{background:#12263f;color:#dbe7f5;padding:14px 16px;border-radius:8px;
+      overflow-x:auto;font-family:Consolas,"Courier New",monospace;font-size:13px;
+      line-height:1.6;margin:10px 0}
+  pre .c{color:#7f9cc0}
+  pre .k{color:#7fd6a0}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;
+       margin-right:6px}
+  .t-rec{background:var(--green-l);color:var(--green);border:1px solid #b8e2c4}
+  .t-alt{background:#eef1f6;color:var(--ink2);border:1px solid var(--line)}
+  .t-no{background:var(--red-l);color:var(--red);border:1px solid #f0bcbc}
+  .path{font-family:Consolas,monospace;font-size:13px;color:#0b3a66;
+        word-break:break-all}
+  ul,ol{padding-left:22px;margin:8px 0}
+  li{margin:4px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);
+         color:var(--ink2);font-size:13px}
+  .step{display:flex;gap:12px;margin:14px 0}
+  .step .n{flex:0 0 28px;height:28px;border-radius:50%;background:var(--blue);
+           color:#fff;text-align:center;line-height:28px;font-weight:bold;font-size:14px}
+  .step .b{flex:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>MCTC-KZ-B0S 测试方案 · 安卓 APP 与 APK 打包指南</h1>
+  <p>电梯协议转换板 1-5 层测试 · 手机端方案 · 生成日期 2026-09-03</p>
+</header>
+
+<div class="verdict">
+  <b>结论：能做，代码已经做完并验证通过。</b>
+  手机没有 RS485 串口，所以安卓版不走串口，改成<b>手机 WiFi → 串口服务器（NA11x / C2000）→ RS485 → 协议转换板</b>，
+  功能与 Windows 桌面版一一对应（一键读五类状态、1-5 层前门、开关门、司机、持续开门、AGV 进出与心跳、通信日志）。<br>
+  唯一的坎是<b>出 APK 需要 Linux 构建环境</b>——这台 Win7/Win10 机器上没有 Android SDK、Java、WSL、Docker，
+  所以推荐用 <b>GitHub Actions 云构建</b>（零安装，约 20-40 分钟出包）。
+</div>
+
+<h2>一、安卓上的连接拓扑（与桌面版的差别）</h2>
+<div class="card">
+<pre style="background:#f2f6fb;color:#1f2430;border:1px solid #dfe4ec">
+  <span class="c">桌面版（现在）</span>
+  PC ──USB/485 转换器── 或 ──网线/WiFi── 串口服务器 ──RS485 38400/8N1── 协议转换板 ── 电梯主控
+
+  <span class="c">安卓版 · 网络模式（默认）</span>
+  手机 ──WiFi TCP── 串口服务器(NA11x 192.168.3.7:8887 / C2000 192.168.4.1:8000)
+                          └─ RS485 38400/8N1 ── 协议转换板 ── 电梯主控
+
+  <span class="c">安卓版 · USB-OTG 直连（免串口服务器）</span>
+  手机 ──OTG 线── USB转485(FTDI/CP210x/CH340/PL2303) ── RS485 38400/8N1 ── 协议转换板 ── 电梯主控
+</pre>
+  <ul>
+    <li><b>串口侧的 38400/8/N/1 仍然要在串口服务器网页里配</b>，手机管不到这一段；手机只负责 TCP 那一段。</li>
+    <li>串口服务器两种模式要和 APP 里的选择对应：<b>透明/透传</b> → APP 选「Modbus RTU 透传」；
+        <b>开了 Modbus 网关</b> → APP 选「Modbus TCP 网关」。<u>选错就是收不到任何响应</u>。</li>
+    <li><b>USB-OTG 直连现已支持</b>（APP 里"连接方式"选「USB OTG 直连」）：手机经 OTG 线接 USB 转 485，走纯 Modbus RTU，串口参数固定 38400/8N1，<b>无需串口服务器</b>，适合没 WiFi 的现场。限制：转换器芯片须为 FTDI/CP210x/CH340/PL2303 之一，且手机已开启 OTG（详见第五章）。</li>
+  </ul>
+</div>
+
+<h2>二、已经交付的文件（全部绝对路径）</h2>
+<table>
+  <tr><th style="width:38%">文件</th><th>说明</th></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\main.py</td>
+      <td>安卓 APP 主程序（Kivy，约 730 行）。协议层不在这里，全部复用 protocol_core.py。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\protocol_core.py</td>
+      <td>协议层，<b>自动生成，勿手改</b>。CRC16/Modbus、帧构建、MBAP 封装解封装、状态解析、连接类。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\sync_protocol.py</td>
+      <td>从桌面版 <span class="path">F:\workbuddy\protocol_converter_test.py</span> 抽取协议层的同步脚本，保证两边协议实现单一来源。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\verify_protocol.py</td>
+      <td>协议层端到端验证（<b>56 项全过</b>），不需要手机和硬件。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\smoke_test.py</td>
+      <td>界面冒烟测试（<b>32 项全过</b>），在 Windows 上提前验证控件、禁用逻辑、输入钳位、参数校验。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\buildozer.spec</td>
+      <td>APK 打包配置（Kivy 2.3.1 / API 34 / NDK 25b / arm64）。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\.github\workflows\build-apk.yml</td>
+      <td>GitHub Actions 云构建工作流，push 标签 <code>v*</code> 或手动触发。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\assets\NotoSansSC-Regular.otf</td>
+      <td>内置开源中文字体（Noto Sans SC，SIL OFL，可自由分发）。安卓 ROM 自带中文字体路径不统一，内置最稳。</td></tr>
+  <tr><td class="path">F:\workbuddy\MCTC_Android\assets\icon.png<br>...\assets\presplash.png</td>
+      <td>512×512 应用图标与启动图，由 <span class="path">make_icons.py</span> 生成。</td></tr>
+</table>
+
+<h2>三、出 APK 的三条路线（推荐第一条）</h2>
+<table>
+  <tr><th style="width:22%">路线</th><th style="width:14%">评价</th><th>说明与代价</th></tr>
+  <tr>
+    <td><b>GitHub Actions 云构建</b></td>
+    <td><span class="tag t-rec">推荐</span></td>
+    <td>本机零安装。把 <span class="path">MCTC_Android</span> 推到 GitHub，打一个 <code>v1.0.0</code> 标签，
+        Actions 自动跑 Buildozer，20-40 分钟后在 Artifacts 里下载 APK。缺点是仓库要公开或占用私有仓库额度，
+        且首次构建需要联网下载 Android SDK/NDK。</td>
+  </tr>
+  <tr>
+    <td><b>WSL2 + Buildozer 本地构建</b></td>
+    <td><span class="tag t-alt">备选</span></td>
+    <td>需要在这台机器上装 WSL2（Ubuntu 22.04）+ 一堆 Linux 依赖，约 10GB 磁盘，首次编译同样半小时以上。
+        好处是后续改代码出包快、不依赖网络。Win7 不支持 WSL2，只能在 Win10/11 上做。</td>
+  </tr>
+  <tr>
+    <td><b>本机直接打包</b></td>
+    <td><span class="tag t-no">不可行</span></td>
+    <td>Buildozer 在 Windows 原生环境不支持 Android 目标（必须 Linux/Docker/WSL）。本机也没有 Docker 与 WSL。</td>
+  </tr>
+</table>
+
+<h3>路线 A：GitHub Actions 出包（一步一步）</h3>
+<div class="card">
+  <p style="margin:0 0 10px"><b>依赖说明：</b>buildozer.spec 已默认把 <code>usb4a, usbserial4a</code> 打进 APK，
+  所以<b>网络模式与 USB-OTG 直连两个都支持</b>。若确定只用网络模式、想减小体积，可把
+  <code>requirements</code> 里的这两项去掉，并删掉 <code>android.manifest.intent_filters</code> 与
+  <span class="path">res\xml\device_filter.xml</span>；USB 模式还需 <code>USB_PERMISSION</code> 权限（已加）。</p>
+  <div class="step"><div class="n">1</div><div class="b">
+    在 GitHub 新建一个空仓库（例如 <code>mctc-android</code>），<b>不要</b>勾 README / .gitignore。
+  </div></div>
+  <div class="step"><div class="n">2</div><div class="b">
+    在本机把 <span class="path">F:\workbuddy\MCTC_Android</span> 整个目录推上去：
+<pre><span class="c"># 在 Git Bash / CMD 里执行（只推这一个目录作为仓库根目录，最省事）</span>
+cd /f/workbuddy/MCTC_Android
+git init
+git add -A
+git commit -m "MCTC 电梯测试 安卓版 v1.0.0"
+git branch -M main
+git remote add origin https://github.com/&lt;你的用户名&gt;/mctc-android.git
+git push -u origin main</pre>
+  </div></div>
+  <div class="step"><div class="n">3</div><div class="b">
+    如果仓库<b>根目录</b>就是这些文件（上面这种推法），把
+    <span class="path">.github\workflows\build-apk.yml</span> 里的 <code>workdir: MCTC_Android</code>
+    改成 <code>workdir: .</code>。<br>
+    如果是把整个 <span class="path">F:\workbuddy</span> 当仓库推，就保持 <code>MCTC_Android</code> 不变。
+  </div></div>
+  <div class="step"><div class="n">4</div><div class="b">
+    打标签触发构建：
+<pre>git commit --allow-empty -m "触发构建"   <span class="c"># 有改动才需要</span>
+git tag v1.0.0
+git push origin v1.0.0</pre>
+    或者直接在仓库的 <b>Actions</b> 页面选 <i>Build Android APK</i> → <b>Run workflow</b>。
+  </div></div>
+  <div class="step"><div class="n">5</div><div class="b">
+    等 20-40 分钟，Actions 页面下载 <b>Artifacts → mctc-apk</b>，得到
+    <code>mctctest-1.0.0-arm64-v8a-debug.apk</code>。传到手机安装（需允许"未知来源安装"）。
+  </div></div>
+</div>
+
+<h3>路线 B：WSL2 + Buildozer 本地构建（命令清单）</h3>
+<div class="card">
+<pre><span class="c"># 1) 管理员 PowerShell 装 WSL2（需要重启，Win10 2004+ / Win11）</span>
+wsl --install -d Ubuntu-22.04
+
+<span class="c"># 2) 进入 Ubuntu，装依赖</span>
+sudo apt update
+sudo apt install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config \
+     zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev \
+     libssl-dev python3-pip python3-setuptools python3-venv
+pip install --user --upgrade Cython virtualenv
+pip install --user --upgrade buildozer
+
+<span class="c"># 3) 把源码拷进 WSL（Windows 盘符挂在 /mnt/）</span>
+cp -r /mnt/f/workbuddy/MCTC_Android ~/mctc-android &amp;&amp; cd ~/mctc-android
+
+<span class="c"># 4) 出包（首次会下载 Android SDK/NDK 并编译 Python+Kivy，约 20-40 分钟）</span>
+buildozer -v android debug
+
+<span class="c"># 5) 产物</span>
+ls -lh bin/*.apk        <span class="c"># 拷贝回 Windows: cp bin/*.apk /mnt/f/workbuddy/</span></pre>
+  <div class="warn"><b>踩坑提示：</b>WSL2 里编译到一半报内存不足，先限制并行度
+    <code>export MAKEFLAGS=-j2</code> 再跑；报 <code>No space left on device</code> 就清理 WSL 虚拟盘。
+    构建中途失败想重来：<code>buildozer android clean</code> 后重跑。</div>
+</div>
+
+<h2>四、改代码后的工作流（重要：别手改 protocol_core.py）</h2>
+<div class="card">
+  <ol>
+    <li>协议要改 → 改桌面版 <span class="path">F:\workbuddy\protocol_converter_test.py</span>；</li>
+    <li>跑桌面自检（应 23 项全过）：
+      <pre>"C:\Users\xuanll\AppData\Local\Programs\Python\Python312\python.exe" "F:\workbuddy\protocol_converter_test.py" --selftest</pre></li>
+    <li>同步协议层到安卓工程并重跑两组测试：
+<pre>cd /f/workbuddy/MCTC_Android
+python sync_protocol.py
+python verify_protocol.py     <span class="c"># 56 项</span>
+python smoke_test.py          <span class="c"># 32 项</span></pre></li>
+    <li>界面要改 → 直接改 <span class="path">F:\workbuddy\MCTC_Android\main.py</span>（UI 层只在这一个文件里）；</li>
+    <li>提交 + 打新标签，云构建出新 APK。</li>
+  </ol>
+</div>
+
+<h2>五、现场使用步骤（手机端）</h2>
+<div class="card">
+  <ol>
+    <li>给串口服务器供电，用网线/或手机连它的 WiFi 热点（NA11x 默认 <b>192.168.3.7</b>，C2000 默认 <b>192.168.4.1</b>）；
+        手机和串口服务器必须在<b>同一网段</b>。</li>
+    <li>先确认串口服务器网页里串口参数是 <b>38400 / 8 / 无校验 / 1</b>，模式是透明传输（或已开 Modbus 网关）。</li>
+    <li>打开 APP → 选服务器类型（自动填 IP 与端口）→ 选传输协议 → 点<b>连接</b>。</li>
+    <li>连接成功后所有操作按钮才可用（未连接时是灰的）。点<b>一键读取电梯状态</b>，
+        系统/运行/门/轿内/楼层五张卡一起刷新；打开<b>自动刷新</b>可每 N 秒轮询。</li>
+    <li>开关门、1-5 层前门、司机开关、持续开门（200ms 循环）都在"控制指令"页。</li>
+    <li>AGV 页：进入/退出 AGV 模式、读 AGV 状态、心跳自动发送（默认 30 秒，上限 120 秒）。</li>
+    <li>"通信日志"页看收发原始帧（蓝色 TX / 绿色 RX），现场排查全靠它。</li>
+  </ol>
+
+  <p style="margin-top:12px"><b>USB-OTG 直连模式（免串口服务器）额外步骤：</b></p>
+  <ol>
+    <li>手机开启 OTG：设置里搜"OTG"（部分机型插上线自动开启）。</li>
+    <li>OTG 线连手机，USB 转 485 转换器接 OTG 线，A/B 端子接协议转换板（与桌面版同样的接法）。</li>
+    <li>打开 APP → "连接方式"选「USB OTG 直连」→ 点<b>扫描</b> → 在下拉框选识别到的设备（已知 485 转换器会排在前面）。</li>
+    <li>首次连接系统弹<b>USB 设备授权</b>框，点"允许"（建议勾选默认）。若误点不允许，需重拔插或到系统设置给本 APP 开 USB 权限。</li>
+    <li>"站址"填协议板地址（默认 1），点<b>连接</b>。其余操作（读状态/开关门/AGV）与网络模式完全一致。</li>
+  </ol>
+</div>
+
+<h2>六、安卓特有的坑（务必看）</h2>
+<table>
+  <tr><th style="width:28%">现象</th><th>原因与处理</th></tr>
+  <tr><td>界面全是方框/豆腐块</td>
+      <td>字体没注册上。已内置 Noto Sans SC，正常不会；若仍出现，确认
+        <span class="path">assets\NotoSansSC-Regular.otf</span> 被打包进去（<code>source.include_exts</code> 必须含 <code>otf</code>）。</td></tr>
+  <tr><td>一联网就闪退</td>
+      <td>安卓禁止主线程做网络操作。本工程已把所有连接/收发放后台线程，改代码时<b>不要</b>把 socket 操作搬回主线程。</td></tr>
+  <tr><td>AGV 心跳发着发着断了</td>
+      <td>安卓会杀后台。现场请<b>保持 APP 在前台、屏幕常亮、关掉电池优化</b>（设置→应用→电池→无限制）。</td></tr>
+  <tr><td>连不上 / 一直"连接中"</td>
+      <td>先手机浏览器 ping 不通就说明不在一个网段；再看串口服务器的 TCP 端口是否被别的客户端占了
+        （多数模块只支持 1-2 路 TCP 连接，电脑上开着 Modbus Poll 时手机就连不上）。</td></tr>
+  <tr><td>能连上但读不到数据</td>
+      <td>99% 是<b>协议模式选错</b>：服务器是透传就选「Modbus RTU 透传」，开了网关就选「Modbus TCP 网关」。
+        其次查串口侧波特率是不是 38400/8N1。</td></tr>
+  <tr><td>装不上 APK</td>
+      <td>打开"允许安装未知应用"；若提示"安装包异常"，多半是下载不完整，重新从 Artifacts 下载。</td></tr>
+  <tr><td>手机是老 32 位机装不上</td>
+      <td>把 buildozer.spec 的 <code>android.archs</code> 改成 <code>arm64-v8a, armeabi-v7a</code> 重新构建。</td></tr>
+  <tr><td>USB 扫描列表为空 / 识别不到</td>
+      <td>①手机 OTG 未开；②OTG 线或转换器坏了；③芯片不在驱动白名单（仅支持 FTDI/CP210x/CH340/PL2303，杂牌 CH34x 克隆片可能认不出）。
+        白名单见 <span class="path">res\xml\device_filter.xml</span>。</td></tr>
+  <tr><td>USB 连上后立刻自动断开</td>
+      <td>拔线看门狗检测到串口没有真正打开——多半是没点"允许 USB 设备"。重拔插转换器，在系统弹窗点允许（勾默认），再点连接。</td></tr>
+</table>
+
+<h2>七、还想要我做什么</h2>
+<div class="card">
+  <ul>
+    <li>把 <span class="path">MCTC_Android</span> 初始化成 git 仓库并写好第一次提交（需要你给 GitHub 仓库地址）。</li>
+    <li>把 APK 名字/图标改成你们公司的，或补上启动页 LOGO。</li>
+    <li>加"测试记录导出"（把日志存成 csv/txt 发到自己邮箱），现场留档更方便。</li>
+    <li>增加多台电梯的配置文件（不同站址/IP 一键切换）。</li>
+  </ul>
+</div>
+
+<footer>
+  关联交付物：<span class="path">F:\workbuddy\协议转换板测试软件.exe</span>（Win7 桌面版，自检 23/23）、
+  <span class="path">F:\workbuddy\ModbusPoll_现场速查卡.html</span>（Modbus Poll 现场速查卡）。<br>
+  协议依据：MCTC-KZ-B0S 通信协议-开放协议 V1.7；串口参数 38400 / 8N1。
+</footer>
+
+</div>
+</body>
+</html>
