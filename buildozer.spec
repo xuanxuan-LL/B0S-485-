@@ -21,7 +21,11 @@ numeric_version = 1
 # 网络 TCP 模式只用 python3 + kivy；USB-OTG 直连需 usb4a/usbserial4a
 # (usb4a 依赖 pyjnius 调用安卓 USB Manager，显式列出更稳)
 # 固定 kivy 版本，避免拉到与当前 Python 不兼容的新版
-requirements = python3,kivy==2.3.1,pyjnius,usb4a,usbserial4a
+# 固定 python3==3.10.13：buildozer 1.6.0 默认拉 CPython 3.12，其
+#   Modules/remote_debugging.c 在 NDK target 23(Android 6) 下调 preadv/pwritev，
+#   旧 API 头未声明这两个函数，clang 的 -Werror=implicit-function-declaration
+#   直接让 python3 recipe 编译失败。3.10 无此问题，且兼容 minapi 23。
+requirements = python3==3.10.13,kivy==2.3.1,pyjnius,usb4a,usbserial4a
 
 # ---- 界面 ----
 orientation = portrait
