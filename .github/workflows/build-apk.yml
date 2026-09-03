@@ -2,10 +2,12 @@
 # 触发方式:  push 标签 v*  或  在 Actions 页面点 "Run workflow"
 # 产物:      Artifacts 里的 mctc-apk（bin/*.apk）
 #
-# 说明: 原先用的 ArtemSBulgakov/buildozer-action@v1 是 Docker 容器动作，
-# 其 Dockerfile 写死了 ppa:openjdk-r/ppa，该 PPA 在新版 Ubuntu 已无 Release 文件，
-# 导致 `apt update` 404、镜像构建失败（与本项目代码无关）。
-# 这里改为在 ubuntu-22.04 原生 runner 上直接跑 buildozer（openjdk-17 在主源里，无需坏 PPA）。
+# 关键坑（均已处理）:
+# 1) 原 Docker 容器 action (ArtemSBulgakov/buildozer-action) 的 Dockerfile 写死 ppa:openjdk-r/ppa，
+#    新版 Ubuntu 已无该 PPA 的 Release 文件 → apt update 404 → 镜像构建失败。故改为原生 runner 手动构建。
+# 2) buildozer 1.6.0 的 android.accept_licenses=True 不会自动接受 build-tools 的许可，
+#    sdkmanager 装包时仍弹 "Accept? (y/N)" 并跳过 → SDK 不全、出不了 APK。故显式 yes | sdkmanager --licenses。
+# 3) buildozer ... | tee 的管道退出码是 tee 的(恒 0)，会掩盖失败。故用 set -o pipefail，且上传 if: success()。
 name: Build Android APK
 
 on:
@@ -40,18 +42,26 @@ jobs:
       - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip
-          pip install "buildozer" "cython==0.29.33"
+          pip install "buildozer==1.6.0" "cython==0.29.33"
+
+      - name: Bootstrap SDK & accept Android licenses
+        run: |
+          SDK=$HOME/.buildozer/android/platform/android-sdk
+          # 第一次 buildozer 会下载并落地 SDK/NDK（许可未接受会中途停，忽略错误）
+          buildozer android debug >/tmp/bootstrap.log 2>&1 || true
+          # 显式接受所有 Android SDK 许可（两种 sdkmanager 路径都试，避免版本差异）
+          yes | "$SDK/tools/bin/sdkmanager" --sdk_root="$SDK" --licenses || true
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses || true
 
       - name: Build APK (buildozer android debug)
         run: |
+          set -o pipefail
           buildozer -v android debug 2>&1 | tee buildozer_build.log
-        env:
-          BUILDOZER_WARN_ON_ROOT: "0"
 
       - name: Upload APK
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: mctc-apk
           path: bin/*.apk
-          if-no-files-found: warn
+          if-no-files-found: error
