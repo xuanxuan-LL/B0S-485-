@@ -15,13 +15,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 本项目在仓库子目录 MCTC_Android 下；
-      # 若单独建仓库且 main.py / buildozer.spec 在根目录，把 workdir 改成 .
+      # 本仓库根目录即 MCTC_Android 内容（main.py / buildozer.spec 在根）
       - name: Build APK with Buildozer
         id: buildozer
         uses: ArtemSBulgakov/buildozer-action@v1
         with:
-          workdir: MCTC_Android
+          workdir: .
           buildozer_version: stable
 
       - name: Upload APK
