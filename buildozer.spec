@@ -25,7 +25,10 @@ numeric_version = 1
 #   Modules/remote_debugging.c 在 NDK target 23(Android 6) 下调 preadv/pwritev，
 #   旧 API 头未声明这两个函数，clang 的 -Werror=implicit-function-declaration
 #   直接让 python3 recipe 编译失败。3.10 无此问题，且兼容 minapi 23。
-requirements = python3==3.10.13,kivy==2.3.1,pyjnius,usb4a,usbserial4a
+# 必须同时固定 hostpython3==3.10.13 与 python3 同版本：p4a 强制要求两者一致，
+#   否则报 "python3 should have same version as hostpython3, 3.10.13 != 3.14.2"
+#   （buildozer 1.6.0 的默认 hostpython3 是 3.14.2）。
+requirements = python3==3.10.13,hostpython3==3.10.13,kivy==2.3.1,pyjnius,usb4a,usbserial4a
 
 # ---- 界面 ----
 orientation = portrait
