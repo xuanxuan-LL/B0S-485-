@@ -67,6 +67,25 @@ jobs:
           set -o pipefail
           buildozer -v android debug 2>&1 | tee buildozer_build.log
 
+      - name: Diagnose manifest on failure
+        if: failure()
+        run: |
+          echo "===== generated AndroidManifest.xml (if any) ====="
+          M=$(find .buildozer -name AndroidManifest.xml -path '*src/main*' 2>/dev/null | head -1)
+          if [ -n "$M" ]; then
+            echo "FILE: $M"
+            cat "$M"
+          else
+            echo "(manifest not found; listing dist tree)"
+            find .buildozer -maxdepth 6 -name '*.xml' 2>/dev/null | head
+          fi
+          echo "===== gradle --stacktrace for the SAX cause ====="
+          DIST=$(find .buildozer -maxdepth 6 -type d -name mctctest 2>/dev/null | head -1)
+          if [ -n "$DIST" ] && [ -f "$DIST/gradlew" ]; then
+            cd "$DIST"
+            ./gradlew processDebugMainManifest --stacktrace 2>&1 | tail -60 || true
+          fi
+
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
