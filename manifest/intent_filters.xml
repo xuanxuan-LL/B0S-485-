@@ -1,6 +1,3 @@
-    <!-- 声明 USB 主机能力（不强制，绝大多数手机自带） -->
-    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
-
     <!-- 监听 USB 设备插入，触发系统授权弹窗 -->
     <intent-filter>
         <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
