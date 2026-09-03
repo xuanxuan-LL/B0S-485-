@@ -1,9 +1,4 @@
-    <!-- 监听 USB 设备插入，触发系统授权弹窗 -->
+    <!-- 监听 USB 设备插入，触发系统授权弹窗（对所有 USB 设备生效） -->
     <intent-filter>
         <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
     </intent-filter>
-
-    <!-- 授权弹窗设备白名单，指向 res/xml/device_filter.xml -->
-    <meta-data
-        android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
-        android:resource="@xml/device_filter" />

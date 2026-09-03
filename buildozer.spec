@@ -42,9 +42,11 @@ presplash.color = #FFFFFF
 # ---- 安卓 ----
 # 网络 TCP 模式需要联网与网络状态权限；USB-OTG 直连需要 USB 主机权限
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,USB_PERMISSION
-# USB 主机能力声明：经 buildozer android.features -> p4a --feature 注入到 manifest 顶层
-# （不能直接放进 intent_filters 片段，<uses-feature> 在 <activity> 内会导致 AAPT 报错）
-android.features = android.hardware.usb.host
+# USB 主机能力声明：固定版 p4a(58d21141) 的 apk 子命令不支持 --feature 参数，
+# 故改用 android.extra_manifest_xml -> p4a --extra-manifest-xml，
+# 该内容被注入到 <manifest> 根层级（<application> 之前），<uses-feature> 在此合法。
+# （不能放进 intent_filters 片段，<uses-feature> 在 <activity> 内会导致 AAPT 报错）
+android.extra_manifest_xml = manifest/extra_manifest.xml
 # 监听 USB 设备插入并弹出授权框（引用 manifest/intent_filters.xml）
 android.manifest.intent_filters = manifest/intent_filters.xml
 
