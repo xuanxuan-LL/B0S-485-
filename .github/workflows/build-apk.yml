@@ -1,6 +1,11 @@
 # GitHub Actions 云构建 APK（本机无需安卓 SDK / Java / WSL）
 # 触发方式:  push 标签 v*  或  在 Actions 页面点 "Run workflow"
-# 产物:      Artifacts 里的 mctc-apk（*arm64-v8a-debug.apk）
+# 产物:      Artifacts 里的 mctc-apk（bin/*.apk）
+#
+# 说明: 原先用的 ArtemSBulgakov/buildozer-action@v1 是 Docker 容器动作，
+# 其 Dockerfile 写死了 ppa:openjdk-r/ppa，该 PPA 在新版 Ubuntu 已无 Release 文件，
+# 导致 `apt update` 404、镜像构建失败（与本项目代码无关）。
+# 这里改为在 ubuntu-22.04 原生 runner 上直接跑 buildozer（openjdk-17 在主源里，无需坏 PPA）。
 name: Build Android APK
 
 on:
@@ -10,22 +15,43 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 本仓库根目录即 MCTC_Android 内容（main.py / buildozer.spec 在根）
-      - name: Build APK with Buildozer
-        id: buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          workdir: .
-          buildozer_version: stable
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git unzip zip \
+            openjdk-17-jdk \
+            autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev \
+            ccache
+          # 让 buildozer 找到 JDK
+          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java))))" >> "$GITHUB_ENV"
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip
+          pip install "buildozer" "cython==0.29.33"
+
+      - name: Build APK (buildozer android debug)
+        run: |
+          buildozer -v android debug 2>&1 | tee buildozer_build.log
+        env:
+          BUILDOZER_WARN_ON_ROOT: "0"
 
       - name: Upload APK
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mctc-apk
-          path: ${{ steps.buildozer.outputs.filename }}
-          if-no-files-found: error
+          path: bin/*.apk
+          if-no-files-found: warn

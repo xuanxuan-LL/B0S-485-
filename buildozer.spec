@@ -48,6 +48,9 @@ android.ndk = 25b
 # 若现场手机是老 32 位机，改成：arm64-v8a, armeabi-v7a
 android.archs = arm64-v8a
 
+# 自动接受 Android SDK 许可，避免云端首次构建卡在确认框
+android.accept_licenses = True
+
 android.allow_backup = True
 android.enable_androidx = True
 
