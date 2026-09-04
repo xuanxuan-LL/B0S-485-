@@ -7,21 +7,28 @@ MCTC-KZ-B0S 电梯测试（安卓版 / Kivy）
 仅 UI 层用 Kivy 重写, 以便在安卓手机上运行。
 
 与桌面版的差异（安卓限制导致）:
-  1) 连接方式只有「网络 TCP」: 手机没有 RS485 串口, 也不建议走 USB-OTG,
-     统一通过 WiFi 连接串口服务器(NA11x / C2000)的 TCP 端口。
+  1) 连接方式支持三种:
+       - 网络 TCP: 手机经 WiFi 连接串口服务器(NA11x / C2000)的 TCP 端口
+       - USB OTG:  手机经 USB 转 485 直连协议转换板(需 APK 打包 USB 驱动)
+       - MQTT 云:  手机 ⇄ 云端 Broker ⇄ TAS-KS-301(4G) ⇄ RS485 ⇄ 协议板,
+                   可跨公网远程监控与控制(见 mqtt_conn.py)
   2) 网络操作(连接/收发)全部放后台线程: 安卓主线程做网络会直接崩。
   3) 中文字体需显式注册: Kivy 默认 Roboto 不含中文字形, 不处理会显示方框。
 
 功能:
   * 串口服务器预设 NA11x(192.168.3.7:8887) / C2000(192.168.4.1:8000) + IP/端口自定义
+  * MQTT 云连接: 服务器/端口/账号/密码/上下行主题均可在界面填写
   * 传输协议切换: Modbus RTU 透传 / Modbus TCP 网关(MBAP)
   * 一键读取电梯状态(系统/运行/门/轿内开关/楼层) + 自动刷新开关 + 间隔(秒)
+  * 电梯面板: 楼层大号数字、运行方向箭头(动画)、门状态动画
   * 1-5 层前门登记、开门/关门、司机功能开关、持续开门信号(200ms)
+  * 远程控制使能开关(默认关): 关闭时 App 仅做只读监控, 防止误触下发指令
   * AGV 进入/退出/读状态、心跳自动发送开关 + 间隔(秒)
   * 通信日志(TX/RX 原始帧 + 解析说明)
 
 协议层来源: protocol_core.py (由 sync_protocol.py 从桌面版自动抽取, 勿手改)
 """
+import math
 import os
 import threading
 import time
@@ -53,6 +60,7 @@ from protocol_core import (
 )
 
 import usb_conn          # USB-OTG 串口通道（非安卓环境里自动降级为不可用）
+import mqtt_conn         # MQTT 云通道（手机 ⇄ Broker ⇄ TAS-KS-301，见 mqtt_conn.py）
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +159,145 @@ class Card(BoxLayout):
         self.val_lbl.color = (r, g, b, 1)
 
 
+# 门状态 -> 开门度(0.0 全关 / 1.0 全开)，用于门动画
+# 0 未知 / 1 开门过程 / 2 开门到位保持 / 3 关门过程 / 4 关门到位保持
+DOOR_OPENNESS = {0: 0.5, 1: 0.78, 2: 1.0, 3: 0.32, 4: 0.0}
+
+
+class DoorView(BoxLayout):
+    """门状态动画：两扇门向两侧收拢表示开门，向中间合拢表示关门。"""
+
+    def __init__(self, **kw):
+        super(DoorView, self).__init__(**kw)
+        self._pos = 0.0
+        self._target = 0.0
+        self._ev = None
+        with self.canvas.after:
+            from kivy.graphics import Color, Rectangle
+            self._c_way = Color(0.16, 0.18, 0.21, 1)      # 门洞(背景)
+            self._r_way = Rectangle(pos=self.pos, size=self.size)
+            self._c_door = Color(0.29, 0.60, 0.85, 1)     # 门扇
+            self._r_left = Rectangle()
+            self._r_right = Rectangle()
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *a):
+        self._r_way.pos = self.pos
+        self._r_way.size = self.size
+        self._draw()
+
+    def _draw(self):
+        x, y = self.pos
+        w, h = self.size
+        half = w / 2.0
+        dw = max(0.0, half * (1.0 - self._pos))
+        self._r_left.pos = (x, y)
+        self._r_left.size = (dw, h)
+        self._r_right.pos = (x + w - dw, y)
+        self._r_right.size = (dw, h)
+
+    def set_openness(self, v, animate=True):
+        self._target = max(0.0, min(1.0, float(v)))
+        if not animate:
+            self._pos = self._target
+            self._draw()
+            self._stop()
+            return
+        if self._ev is None:
+            self._ev = Clock.schedule_interval(self._tick, 1 / 30.0)
+
+    def set_door(self, code):
+        """按协议门状态码设置动画。"""
+        if code in (1, 2):
+            self._c_door.rgba = (0.29, 0.60, 0.85, 1)     # 开 -> 蓝
+        elif code in (3, 4):
+            self._c_door.rgba = (0.55, 0.55, 0.55, 1)     # 关 -> 灰
+        else:
+            self._c_door.rgba = (0.85, 0.62, 0.20, 1)     # 未知 -> 橙
+        self.set_openness(DOOR_OPENNESS.get(code, 0.0))
+
+    def _tick(self, dt):
+        d = self._target - self._pos
+        if abs(d) < 0.008:
+            self._pos = self._target
+            self._draw()
+            self._stop()
+            return
+        self._pos += d * min(1.0, dt * 9.0)
+        self._draw()
+
+    def _stop(self):
+        if self._ev is not None:
+            try:
+                Clock.unschedule(self._ev)
+            except Exception:
+                pass
+            self._ev = None
+
+
+class ArrowView(BoxLayout):
+    """运行方向箭头：0 停梯(横杠) / 1 上行(↑浮动) / 2 下运行(↓浮动)。"""
+
+    def __init__(self, **kw):
+        super(ArrowView, self).__init__(**kw)
+        self._dir = 0
+        self._phase = 0.0
+        self._ev = None
+        with self.canvas.after:
+            from kivy.graphics import Color, Rectangle, Triangle
+            self._c = Color(0.60, 0.60, 0.60, 1)
+            self._tri = Triangle()
+            self._bar = Rectangle()
+        self.bind(pos=self._draw, size=self._draw)
+        self.set_dir(0, animate=False)
+
+    def set_dir(self, code, animate=True):
+        self._dir = code
+        if code == 1:
+            self._c.rgba = (0.10, 0.62, 0.30, 1)          # 上行 -> 绿
+        elif code == 2:
+            self._c.rgba = (0.10, 0.31, 0.65, 1)          # 下行 -> 蓝
+        else:
+            self._c.rgba = (0.60, 0.60, 0.60, 1)          # 停梯 -> 灰
+        if animate and code:
+            if self._ev is None:
+                self._ev = Clock.schedule_interval(self._tick, 1 / 20.0)
+        else:
+            self._phase = 0.0
+            if self._ev is not None:
+                try:
+                    Clock.unschedule(self._ev)
+                except Exception:
+                    pass
+                self._ev = None
+        self._draw()
+
+    def _tick(self, dt):
+        self._phase = (self._phase + dt * 1.5) % 1.0
+        self._draw()
+
+    def _draw(self, *a):
+        x, y = self.pos
+        w, h = self.size
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        hw = max(1.0, w * 0.20)
+        hh = max(1.0, h * 0.22)
+        if not self._dir:
+            self._tri.points = [x, y, x, y, x, y]         # 收起三角形
+            self._bar.pos = (cx - hw, cy - max(1.0, h * 0.045))
+            self._bar.size = (hw * 2, max(2.0, h * 0.09))
+            return
+        self._bar.size = (0, 0)
+        off = math.sin(self._phase * 2 * math.pi) * (h * 0.10)
+        if self._dir == 1:
+            cy -= off
+            self._tri.points = [cx, cy + hh, cx - hw, cy - hh, cx + hw, cy - hh]
+        else:
+            cy += off
+            self._tri.points = [cx, cy - hh, cx - hw, cy + hh, cx + hw, cy + hh]
+
+
 class MCTCApp(App):
     title = "MCTC 电梯测试（安卓版）"
 
@@ -159,18 +306,23 @@ class MCTCApp(App):
         self.conn = None
         self.addr = 1
         self.timeout = 0.8
+        self.mqtt_timeout = 3.0        # MQTT 经公网往返较慢，超时放宽
         self.host = "192.168.3.7"
         self.netport = 8887
-        self.proto = "rtu"          # rtu | tcp
+        self.proto = "rtu"             # rtu | tcp
+        self.link = "net"              # net | usb | mqtt
+        self.ctrl_enabled = False      # 远程控制使能（默认关 = 只读监控）
         self._txid = 0
         self._hb_counter = 0
         self._alive = True
         self.lock = threading.Lock()
-        self.action_widgets = []
+        self.action_widgets = []       # 连接后才可用的控件
+        self.ctrl_widgets = []         # 还需「远程控制使能」才可用的控件
         self._log_lines = []
 
         root = BoxLayout(orientation="vertical")
         root.add_widget(self._build_tabs())
+        self._set_ctrl_enabled(False)      # 默认只读，需手动开启控制
         root.add_widget(self._build_statusbar())
         Clock.schedule_once(lambda dt: self._welcome(), 0.1)
         return root
@@ -225,8 +377,9 @@ class MCTCApp(App):
 
     @staticmethod
     def _row(height=dp(42), **kw):
+        kw.setdefault("spacing", dp(6))
         return BoxLayout(orientation="horizontal", size_hint_y=None,
-                         height=height, spacing=dp(6), **kw)
+                         height=height, **kw)
 
     def _labeled_input(self, row, label, text, w=0.45, hint=""):
         lbl = Label(text=label, font_name=FONT, font_size=sp(13),
@@ -306,12 +459,48 @@ class MCTCApp(App):
 
         self.usb_rows = [row_usb, row_info]
 
+    def _build_mqtt_rows(self):
+        row_host = self._row()
+        self.ent_mqtt_host = self._labeled_input(
+            row_host, "服务器", "", 0.34, hint="域名或 IP")
+        self.ent_mqtt_port = self._labeled_input(row_host, "端口", "1883", 0.30)
+
+        row_auth = self._row()
+        self.ent_mqtt_user = self._labeled_input(row_auth, "账号", "", 0.24)
+        self.ent_mqtt_pwd = self._labeled_input(
+            row_auth, "密码", "", 0.24, hint="可留空")
+
+        row_down = self._row()
+        self.ent_mqtt_down = self._labeled_input(
+            row_down, "下行主题", "mctc/down", 0.34)
+        row_up = self._row()
+        self.ent_mqtt_up = self._labeled_input(row_up, "上行主题", "mctc/up", 0.34)
+
+        row_addr_m = self._row()
+        self.ent_addr_m = self._labeled_input(row_addr_m, "站址(HEX)", "1", 0.24)
+
+        row_tip = self._row(height=dp(46))
+        tip = Label(text="下行主题 = App→DTU（DTU 用 AT+MQTTSUB 订阅）；"
+                         "上行主题 = DTU→App（DTU 用 AT+MQTTPUB 发布）。"
+                         "两端均传 Modbus-RTU 原始帧",
+                    font_name=FONT, font_size=sp(11),
+                    color=(0.4, 0.4, 0.4, 1), halign="left", valign="middle")
+        tip.bind(size=lambda *a: setattr(tip, "text_size", (a[0].width, None)))
+        row_tip.add_widget(tip)
+
+        self.mqtt_rows = [row_host, row_auth, row_down, row_up, row_addr_m,
+                          row_tip]
+
     def _apply_link_mode(self, text):
         """按连接方式重建参数区。"""
-        usb = text.startswith("USB")
-        self.link = "usb" if usb else "net"
+        if text.startswith("USB"):
+            self.link, rows = "usb", self.usb_rows
+        elif text.startswith("MQTT"):
+            self.link, rows = "mqtt", self.mqtt_rows
+        else:
+            self.link, rows = "net", self.tcp_rows
         self.box_params.clear_widgets()
-        for r in (self.usb_rows if usb else self.tcp_rows):
+        for r in rows:
             self.box_params.add_widget(r)
 
     def on_link_change(self, spinner, text):
@@ -323,6 +512,15 @@ class MCTCApp(App):
                 self.log("当前环境未加载 USB 驱动（%s），正式 APK 里才可用"
                          % usb_conn.USB_ERR, "fail")
             self._scan_usb()
+        elif text.startswith("MQTT"):
+            self.log("连接方式=MQTT 云：手机 ⇄ 云端 Broker ⇄ TAS-KS-301(4G) "
+                     "⇄ RS485 ⇄ 协议板", "info")
+            if not mqtt_conn.MQTT_OK:
+                self.log("当前环境未加载 paho-mqtt（%s），正式 APK 里才可用"
+                         % mqtt_conn.MQTT_ERR, "fail")
+            self.log("提示：建议在 DTU 侧关闭业务心跳包/注册包"
+                     "（AT+KEEPALIVE / AT+DTUID），否则它们也会混进上行主题",
+                     "info")
         else:
             self.log("连接方式=网络 TCP：手机 → WiFi → 串口服务器，保留上一次的 "
                      "IP/端口与传输协议设置", "info")
@@ -367,7 +565,8 @@ class MCTCApp(App):
         row_link.add_widget(lbl)
         self.sp_link = Spinner(text="网络 TCP（串口服务器）", font_name=FONT,
                                font_size=sp(13), size_hint_x=0.72,
-                               values=["网络 TCP（串口服务器）", "USB OTG 直连"])
+                               values=["网络 TCP（串口服务器）", "USB OTG 直连",
+                                       "MQTT 云（TAS-KS-301）"])
         self.sp_link.bind(text=self.on_link_change)
         row_link.add_widget(self.sp_link)
         inner.add_widget(row_link)
@@ -384,6 +583,7 @@ class MCTCApp(App):
         self._usb_event = None      # USB 拔线看门狗
         self._build_tcp_rows()
         self._build_usb_rows()
+        self._build_mqtt_rows()
         self._apply_link_mode("网络 TCP（串口服务器）")
 
         row_conn = self._row(height=dp(48))
@@ -432,6 +632,41 @@ class MCTCApp(App):
         self.floor_card.add_widget(self.lbl_floor)
         inner.add_widget(self.floor_card)
 
+        # 电梯面板：运行方向箭头 + 门状态动画
+        inner.add_widget(self._section("电梯面板"))
+        row_panel = self._row(height=dp(124), spacing=dp(8))
+
+        def _panel_title(text):
+            l = Label(text=text, font_name=FONT, font_size=sp(12),
+                      color=(0.42, 0.42, 0.42, 1), size_hint_y=None,
+                      height=dp(18), halign="left", valign="middle")
+            l.bind(size=lambda *a: setattr(l, "text_size", (a[0].width, None)))
+            return l
+
+        def _panel_text():
+            return Label(text="--", font_name=FONT, font_size=sp(13),
+                         bold=True, color=(0.35, 0.35, 0.35, 1),
+                         size_hint_y=None, height=dp(20))
+
+        box_dir = BoxLayout(orientation="vertical", size_hint_x=0.3,
+                            spacing=dp(2))
+        box_dir.add_widget(_panel_title("运行方向"))
+        self.view_dir = ArrowView()
+        box_dir.add_widget(self.view_dir)
+        self.lbl_dir = _panel_text()
+        box_dir.add_widget(self.lbl_dir)
+        row_panel.add_widget(box_dir)
+
+        box_door = BoxLayout(orientation="vertical", size_hint_x=0.7,
+                             spacing=dp(2))
+        box_door.add_widget(_panel_title("门状态"))
+        self.view_door = DoorView()
+        box_door.add_widget(self.view_door)
+        self.lbl_door_anim = _panel_text()
+        box_door.add_widget(self.lbl_door_anim)
+        row_panel.add_widget(box_door)
+        inner.add_widget(row_panel)
+
         # 一键读取 + 自动刷新
         row_read = self._row(height=dp(50))
         self.btn_read = Button(text="一键读取电梯状态", font_name=FONT,
@@ -472,6 +707,21 @@ class MCTCApp(App):
         inner = BoxLayout(orientation="vertical", spacing=dp(8),
                           padding=[dp(10), dp(10)])
 
+        # 远程控制使能：默认关闭，App 仅做只读监控，防误触下发指令到真梯
+        inner.add_widget(self._section("远程控制使能"))
+        row_en, self.sw_ctrl = self._switch_row("允许下发控制指令",
+                                                height=dp(46))
+        self.sw_ctrl.bind(active=self.on_ctrl_enable)
+        inner.add_widget(row_en)
+        row_en_tip = self._row(height=dp(32))
+        tip_en = Label(text="关闭时仅读取状态；呼梯 / 开关门等写指令不可用",
+                       font_name=FONT, font_size=sp(11),
+                       color=(0.4, 0.4, 0.4, 1), halign="left", valign="middle")
+        tip_en.bind(size=lambda *a: setattr(tip_en,
+                                           "text_size", (a[0].width, None)))
+        row_en_tip.add_widget(tip_en)
+        inner.add_widget(row_en_tip)
+
         inner.add_widget(self._section("1-5 层前门指令（登记到内呼）"))
         grid = GridLayout(cols=3, size_hint_y=None, height=dp(112),
                           spacing=dp(6))
@@ -480,6 +730,7 @@ class MCTCApp(App):
             b.bind(on_release=lambda *a, fl=f: self.front_call(fl))
             grid.add_widget(b)
             self.action_widgets.append(b)
+            self.ctrl_widgets.append(b)
         inner.add_widget(grid)
 
         inner.add_widget(self._section("开关门控制"))
@@ -492,17 +743,20 @@ class MCTCApp(App):
         row_door.add_widget(b_close)
         inner.add_widget(row_door)
         self.action_widgets += [b_open, b_close]
+        self.ctrl_widgets += [b_open, b_close]
 
         inner.add_widget(self._section("司机功能 / 持续开门"))
         row_drv, self.sw_driver = self._switch_row("司机功能开 (写 0x9CA0=1)")
         self.sw_driver.bind(active=self.toggle_driver)
         inner.add_widget(row_drv)
         self.action_widgets.append(self.sw_driver)
+        self.ctrl_widgets.append(self.sw_driver)
 
         row_cont, self.sw_cont = self._switch_row("持续开门信号 (200ms)")
         self.sw_cont.bind(active=self.toggle_cont_open)
         inner.add_widget(row_cont)
         self.action_widgets.append(self.sw_cont)
+        self.ctrl_widgets.append(self.sw_cont)
 
         tip = Label(text="持续开门信号：每 200 毫秒循环发送开门指令 (0x9C56=0x0003)，"
                          "取消勾选即停止",
@@ -524,11 +778,13 @@ class MCTCApp(App):
         self.btn_enter = Button(text="进入 AGV 模式", font_name=FONT, font_size=sp(14))
         self.btn_enter.bind(on_release=lambda *a: self.enter_agv())
         row1.add_widget(self.btn_enter)
-        row1.add_widget(Button(text="退出 AGV 模式", font_name=FONT,
-                               font_size=sp(14),
-                               on_release=lambda *a: self.exit_agv()))
+        self.btn_exit = Button(text="退出 AGV 模式", font_name=FONT,
+                               font_size=sp(14))
+        self.btn_exit.bind(on_release=lambda *a: self.exit_agv())
+        row1.add_widget(self.btn_exit)
         inner.add_widget(row1)
-        self.action_widgets.append(self.btn_enter)
+        self.action_widgets += [self.btn_enter, self.btn_exit]
+        self.ctrl_widgets += [self.btn_enter, self.btn_exit]
 
         row2 = self._row(height=dp(50))
         b_read = Button(text="读取 AGV 状态", font_name=FONT, font_size=sp(14))
@@ -554,6 +810,7 @@ class MCTCApp(App):
         self.sw_hb.bind(active=self.on_agv_hb_toggle)
         inner.add_widget(row_hb)
         self.action_widgets.append(self.sw_hb)
+        self.ctrl_widgets.append(self.sw_hb)
 
         row_iv = self._row(height=dp(44))
         lbl_i = Label(text="间隔", font_name=FONT, font_size=sp(13),
@@ -650,15 +907,46 @@ class MCTCApp(App):
         return self.proto == "tcp"
 
     def ensure_params(self):
-        # 站址两种模式都要校验
+        # 站址三种模式都要校验（MQTT 参数区有自己的站址输入框）
+        mqtt = getattr(self, "link", "net") == "mqtt"
+        addr_field = self.ent_addr_m if mqtt else self.ent_addr
         try:
-            self.addr = int(self.ent_addr.text.strip(), 16)
+            self.addr = int(addr_field.text.strip(), 16)
         except ValueError:
             self.alert("站址必须为十六进制（如 1）")
             return False
         if not (1 <= self.addr <= 247):
             self.alert("站址范围 1-247")
             return False
+
+        # MQTT 云模式：校验服务器 / 端口 / 主题
+        if mqtt:
+            self.mqtt_host = self.ent_mqtt_host.text.strip()
+            try:
+                self.mqtt_port = int((self.ent_mqtt_port.text.strip()
+                                      or "1883"))
+            except ValueError:
+                self.alert("MQTT 端口必须为数字")
+                return False
+            self.mqtt_user = self.ent_mqtt_user.text.strip()
+            self.mqtt_pwd = self.ent_mqtt_pwd.text.strip()
+            self.mqtt_down = self.ent_mqtt_down.text.strip()
+            self.mqtt_up = self.ent_mqtt_up.text.strip()
+            if not self.mqtt_host:
+                self.alert("请填写 MQTT 服务器地址（域名或 IP）")
+                return False
+            if not (1 <= self.mqtt_port <= 65535):
+                self.alert("MQTT 端口范围 1-65535")
+                return False
+            if not self.mqtt_down or not self.mqtt_up:
+                self.alert("请填写下行主题（App→DTU）与上行主题（DTU→App）")
+                return False
+            if self.mqtt_down == self.mqtt_up:
+                self.alert("下行主题与上行主题不能相同\n"
+                           "（否则会把自己发的指令当成响应收回来）")
+                return False
+            return True
+
         # USB-OTG 直连：校验是否已选到设备（无 IP/端口）
         if getattr(self, "link", "net") == "usb":
             dev = self._current_usb_device()
@@ -721,6 +1009,15 @@ class MCTCApp(App):
                                        "请在弹出的对话框中允许访问后重试")
                 self.conn = conn
                 label = "USB %s" % dev["label"]
+            elif getattr(self, "link", "net") == "mqtt":
+                conn = mqtt_conn.MqttConn(
+                    host=self.mqtt_host, port=self.mqtt_port,
+                    username=self.mqtt_user, password=self.mqtt_pwd,
+                    topic_down=self.mqtt_down, topic_up=self.mqtt_up,
+                    io_timeout=self.mqtt_timeout)
+                conn.open()
+                self.conn = conn
+                label = "MQTT %s:%d" % (self.mqtt_host, self.mqtt_port)
             else:
                 conn = TcpConn(self.host, self.netport)
                 conn.open()
@@ -755,6 +1052,12 @@ class MCTCApp(App):
             self.alert("USB 连接失败：\n%s\n\n请检查：OTG 转接线插好、手机已开启 OTG、"
                        "转换器芯片为 FTDI/CP210x/CH340/PL2303 之一、并已授权该 USB 设备"
                        % err)
+        elif getattr(self, "link", "net") == "mqtt":
+            self.alert("MQTT 连接失败：\n%s\n\n请检查：\n"
+                       "1) 手机能正常上网（4G/WiFi）\n"
+                       "2) 服务器地址与端口是否正确、Broker 是否放行该端口\n"
+                       "3) 账号密码是否正确、客户端 ID 是否与他人重复\n"
+                       "4) TAS-KS-301 是否已配置为 MQTT 模式并在线" % err)
         else:
             self.alert("连接失败：\n%s\n\n请检查：手机与串口服务器是否同网段、"
                        "IP/端口是否正确、服务器是否为 TCP Server 模式" % err)
@@ -800,6 +1103,10 @@ class MCTCApp(App):
                 w.disabled = not on
             except Exception:
                 pass
+        # 写指令控件还受「远程控制使能」门控：连接成功不得顺带解锁它们，
+        # 否则一连上就能发呼梯/开关门，使能开关形同虚设。
+        if on and not self.ctrl_enabled:
+            self._set_ctrl_enabled(False)
         if not on:
             # 断开时关闭所有定时任务
             for sw in (self.sw_autoref, self.sw_cont, self.sw_hb):
@@ -808,6 +1115,37 @@ class MCTCApp(App):
                         sw.active = False
                 except Exception:
                     pass
+
+    def _set_ctrl_enabled(self, on):
+        """远程控制使能：门控所有会写寄存器的控件（楼层/开关门/司机/AGV）。"""
+        for w in self.ctrl_widgets:
+            try:
+                w.disabled = not on
+            except Exception:
+                pass
+
+    def on_ctrl_enable(self, sw, active):
+        self.ctrl_enabled = bool(active)
+        self._set_ctrl_enabled(self.ctrl_enabled)
+        if active:
+            self.log("已开启远程控制：现在可以下发呼梯 / 开关门等写指令", "info")
+        else:
+            self.log("已关闭远程控制：App 仅做只读监控，写指令已禁用", "info")
+            # 一并停掉持续性写指令，避免关了开关后台还在发
+            for s in (self.sw_cont, self.sw_hb):
+                try:
+                    if s.active:
+                        s.active = False
+                except Exception:
+                    pass
+
+    def _ctrl_allowed(self, what):
+        """写指令统一前置校验：远程控制未开启时拒绝下发。"""
+        if self.ctrl_enabled:
+            return True
+        self.log("远程控制未开启，「%s」已忽略\n"
+                 "  → 请在「控制」页打开「允许下发控制指令」" % what, "fail")
+        return False
 
     # ---- 指令发送（后台线程，UI 更新切回主线程）----
     def send_async(self, frame, label, parser=None, quiet=False):
@@ -830,7 +1168,10 @@ class MCTCApp(App):
             try:
                 self.conn.write(wire)
                 time.sleep(0.01)
-                resp = self.conn.read_frame(self.timeout, 0.05)
+                # MQTT 经公网往返较慢，超时放宽，否则会把慢响应误判成无响应
+                to = (self.mqtt_timeout if getattr(self, "link", "net") == "mqtt"
+                      else self.timeout)
+                resp = self.conn.read_frame(to, 0.05)
             except Exception as e:
                 self.log("%s → 收发异常: %s" % (label, e), "fail")
                 return
@@ -875,6 +1216,25 @@ class MCTCApp(App):
             "#222222")
         arrow = {1: "↑ ", 2: "↓ "}.get(res["run"], "")
         self.lbl_floor.text = "%s%d 楼" % (arrow, res["floor"])
+        # 方向箭头 + 门状态动画
+        try:
+            self.view_dir.set_dir(res["run"])
+            self.lbl_dir.text = RUN_MAP.get(res["run"], "--")
+            self.lbl_dir.color = self._hex2rgba(self._run_color(res["run"]))
+            self.view_door.set_door(res["door"])
+            self.lbl_door_anim.text = DOOR_MAP.get(res["door"], "--")
+            self.lbl_door_anim.color = self._hex2rgba(
+                self._door_color(res["door"]))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _hex2rgba(h, a=1.0):
+        try:
+            r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+            return (r, g, b, a)
+        except Exception:
+            return (0.35, 0.35, 0.35, a)
 
     @staticmethod
     def _sys_color(v):
@@ -922,6 +1282,9 @@ class MCTCApp(App):
             self._interval_of(self.ent_interval.text, 3.0, 0.5, 60))
 
     def toggle_cont_open(self, sw, active):
+        if active and not self._ctrl_allowed("持续开门信号"):
+            sw.active = False
+            return
         if active:
             self.log("开启持续开门信号: 每 200 毫秒发送一次开门指令", "info")
             self._cont_open_tick()
@@ -937,6 +1300,9 @@ class MCTCApp(App):
         Clock.schedule_once(self._cont_open_tick, 0.2)
 
     def on_agv_hb_toggle(self, sw, active):
+        if active and not self._ctrl_allowed("AGV 心跳自动发送"):
+            sw.active = False
+            return
         if active:
             self.log("开启 AGV 心跳自动发送: 每 %ss 写一次 0x9CA6"
                      % self.ent_hb.text, "info")
@@ -963,26 +1329,39 @@ class MCTCApp(App):
                         "一键读取电梯状态(0x9C41×5)", parse_status)
 
     def front_call(self, floor):
+        if not self._ctrl_allowed("登记 %d 楼前门" % floor):
+            return
         self.send_async(build_write(self.addr, REG_FRONT, floor),
                         "登记 %d 楼前门指令到内呼" % floor)
 
     def open_door(self):
+        if not self._ctrl_allowed("开门指令"):
+            return
         self.send_async(build_write(self.addr, REG_DOOR_CTRL, OPEN_VAL), "开门指令")
 
     def close_door(self):
+        if not self._ctrl_allowed("关门指令"):
+            return
         self.send_async(build_write(self.addr, REG_DOOR_CTRL, CLOSE_VAL), "关门指令")
 
     def toggle_driver(self, sw, active):
+        if active and not self._ctrl_allowed("司机功能开"):
+            sw.active = False
+            return
         val = 1 if active else 0
         self.send_async(build_write(self.addr, REG_DRIVER, val),
                         "司机功能%s (0x9CA0=%d)" % ("开" if val else "关", val),
                         quiet=True)
 
     def enter_agv(self):
+        if not self._ctrl_allowed("进入 AGV 模式"):
+            return
         self.send_async(build_write(self.addr, REG_AGV_CTRL, 1),
                         "进入AGV模式(0x9CA4=1)")
 
     def exit_agv(self):
+        if not self._ctrl_allowed("退出 AGV 模式"):
+            return
         self.send_async(build_write(self.addr, REG_AGV_CTRL, 0),
                         "退出AGV模式(0x9CA4=0)")
 

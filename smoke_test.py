@@ -78,7 +78,11 @@ chk("未连接: 全部动作禁用",
     all(w.disabled for w in app.action_widgets),
     "共 %d 个控件" % len(app.action_widgets))
 app._set_actions_enabled(True)
-chk("已连接: 全部动作启用", all(not w.disabled for w in app.action_widgets))
+chk("已连接: 非控制动作启用",
+    all(not w.disabled for w in app.action_widgets
+        if w not in app.ctrl_widgets))
+chk("已连接但未开使能: 控制动作仍禁用",
+    all(w.disabled for w in app.ctrl_widgets))
 
 sec("5) 间隔输入钳位（防手抖填崩）")
 chk("刷新默认 3 秒", app._interval_of("3", 3, 0.5, 60) == 3)
@@ -169,6 +173,99 @@ chk("已记录 usb_device", getattr(app, "usb_device", None) is fake)
 app.sp_link.text = "网络 TCP（串口服务器）"
 app.on_link_change(app.sp_link, "网络 TCP（串口服务器）")
 chk("切回网络模式", app.link == "net", app.link)
+
+sec("10) MQTT 云模式")
+import mqtt_conn as MC
+chk("MQTT 模块可导入", MC is not None)
+chk("paho-mqtt 可用", MC.MQTT_OK is True, MC.MQTT_ERR)
+app.sp_link.text = "MQTT 云（TAS-KS-301）"
+app.on_link_change(app.sp_link, "MQTT 云（TAS-KS-301）")
+chk("连接模式=mqtt", app.link == "mqtt", app.link)
+chk("参数区出现 MQTT 控件",
+    all(hasattr(app, n) for n in ("ent_mqtt_host", "ent_mqtt_port",
+                                  "ent_mqtt_user", "ent_mqtt_pwd",
+                                  "ent_mqtt_down", "ent_mqtt_up",
+                                  "ent_addr_m")))
+
+
+def try_mqtt(host, port, down="mctc/down", up="mctc/up", addr="1"):
+    _alerts.clear()
+    app.ent_mqtt_host.text = host
+    app.ent_mqtt_port.text = port
+    app.ent_mqtt_down.text = down
+    app.ent_mqtt_up.text = up
+    app.ent_addr_m.text = addr
+    ok = app.ensure_params()
+    return ok, (_alerts[-1] if _alerts else "")
+
+
+ok, msg = try_mqtt("", "1883")
+chk("空服务器地址被拦下", ok is False, msg)
+ok, msg = try_mqtt("broker.example.com", "abc")
+chk("非法端口被拦下", ok is False, msg)
+ok, msg = try_mqtt("broker.example.com", "70000")
+chk("端口越界被拦下", ok is False, msg)
+ok, msg = try_mqtt("broker.example.com", "1883", down="", up="mctc/up")
+chk("空主题被拦下", ok is False, msg)
+ok, msg = try_mqtt("broker.example.com", "1883", down="same", up="same")
+chk("上下行主题相同被拦下", ok is False, msg)
+ok, msg = try_mqtt("broker.example.com", "1883", addr="0")
+chk("MQTT 站址 0 被拦下", ok is False, msg)
+ok, msg = try_mqtt("broker.example.com", "1883")
+chk("合法 MQTT 参数通过", ok is True, msg)
+chk("站址取自 MQTT 区输入框", app.addr == 1, str(app.addr))
+# DTU 透传的是原始 RTU 帧，MQTT 模式必须禁用 MBAP 封装
+app.sp_proto.text = "Modbus TCP 网关"
+chk("MQTT 模式强制 RTU(不封装 MBAP)", app.use_tcp_mbap() is False)
+app.sp_proto.text = "Modbus RTU 透传"
+
+sec("11) 远程控制使能门控")
+chk("默认关闭(只读监控)", app.ctrl_enabled is False, str(app.ctrl_enabled))
+chk("受门控控件已收集", len(app.ctrl_widgets) >= 9,
+    "%d 个" % len(app.ctrl_widgets))
+app._set_actions_enabled(True)          # 模拟已连接
+chk("已连接但未开使能: 写指令仍禁用",
+    all(w.disabled for w in app.ctrl_widgets))
+chk("只读指令不受门控(一键读取)",
+    app.btn_read not in app.ctrl_widgets)
+
+_sent = []
+app.send_async = lambda *a, **k: _sent.append(a)
+app.front_call(3)
+app.open_door()
+app.close_door()
+app.enter_agv()
+app.exit_agv()
+chk("未开使能: 写指令全部被拦截", len(_sent) == 0,
+    "实际下发 %d 条" % len(_sent))
+app.sw_cont.active = True
+chk("未开使能: 持续开门开关自动回弹", app.sw_cont.active is False)
+
+app.sw_ctrl.active = True               # 经 Kivy 绑定触发 on_ctrl_enable
+chk("开启使能", app.ctrl_enabled is True)
+chk("开启后写指令控件启用", all(not w.disabled for w in app.ctrl_widgets))
+app.front_call(3)
+app.open_door()
+app.close_door()
+chk("开启后写指令可下发", len(_sent) == 3, "实际 %d 条" % len(_sent))
+app.sw_cont.active = True
+chk("开启使能后可开持续开门", app.sw_cont.active is True)
+app.sw_ctrl.active = False
+chk("关闭使能: 持续开门被自动停掉", app.sw_cont.active is False)
+chk("关闭使能: 写指令控件重新禁用",
+    all(w.disabled for w in app.ctrl_widgets))
+
+sec("12) 电梯面板（方向箭头 / 门动画）")
+chk("方向箭头控件存在", hasattr(app, "view_dir"))
+chk("门动画控件存在", hasattr(app, "view_door"))
+app._update_status(res)                 # 复用第 6 节的解析结果
+chk("方向箭头跟随运行状态", app.view_dir._dir == res["run"],
+    "dir=%s run=%s" % (app.view_dir._dir, res["run"]))
+chk("门动画开门度已设置",
+    abs(app.view_door._target - M.DOOR_OPENNESS[res["door"]]) < 1e-6,
+    "target=%s door=%s" % (app.view_door._target, res["door"]))
+chk("门状态文字已更新", app.lbl_door_anim.text != "--", app.lbl_door_anim.text)
+chk("方向文字已更新", app.lbl_dir.text != "--", app.lbl_dir.text)
 
 sec("结果: %d 通过 / %d 失败" % (npass, nfail))
 sys.exit(1 if nfail else 0)

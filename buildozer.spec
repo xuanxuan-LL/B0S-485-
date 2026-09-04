@@ -18,8 +18,9 @@ version = 1.0.0
 numeric_version = 1
 
 # ---- 依赖 ----
-# 网络 TCP 模式只用 python3 + kivy；USB-OTG 直连需 usb4a/usbserial4a
-# (usb4a 依赖 pyjnius 调用安卓 USB Manager，显式列出更稳)
+# 三种连接模式所需依赖：
+#   网络 TCP / MQTT 云 -> python3 + kivy（MQTT 还需 paho-mqtt）
+#   USB-OTG 直连       -> usb4a / usbserial4a（依赖 pyjnius 调安卓 USB Manager）
 # 固定 kivy 版本，避免拉到与当前 Python 不兼容的新版
 # 固定 python3==3.10.13：buildozer 1.6.0 默认拉 CPython 3.12，其
 #   Modules/remote_debugging.c 在 NDK target 23(Android 6) 下调 preadv/pwritev，
@@ -28,7 +29,8 @@ numeric_version = 1
 # 必须同时固定 hostpython3==3.10.13 与 python3 同版本：p4a 强制要求两者一致，
 #   否则报 "python3 should have same version as hostpython3, 3.10.13 != 3.14.2"
 #   （buildozer 1.6.0 的默认 hostpython3 是 3.14.2）。
-requirements = python3==3.10.13,hostpython3==3.10.13,kivy==2.3.1,pyjnius,usb4a,usbserial4a
+# paho-mqtt：MQTT 云模式（手机 ⇄ 云端 Broker ⇄ TAS-KS-301）用，纯 Python 无需 recipe
+requirements = python3==3.10.13,hostpython3==3.10.13,kivy==2.3.1,pyjnius,usb4a,usbserial4a,paho-mqtt
 
 # ---- 界面 ----
 orientation = portrait
