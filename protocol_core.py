@@ -60,6 +60,7 @@ import os
 import sys
 import time
 import socket
+import queue
 import threading
 try:
     import serial
@@ -71,12 +72,13 @@ except ImportError:
 # 能在无 GUI 环境(如安卓版 Kivy APP)中被 import 复用。
 try:
     import tkinter as tk
-    from tkinter import ttk, messagebox, scrolledtext
+    from tkinter import ttk, messagebox, scrolledtext, filedialog
 except ImportError:
     tk = None          # 无图形界面环境(如 --selftest 或安卓端)仍可复用协议层
     ttk = None
     messagebox = None
     scrolledtext = None
+    filedialog = None
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,17 +91,46 @@ SERVER_PRESETS = {
 
 # ---------------------------------------------------------------------------
 # CRC16 / Modbus  (poly=0xA001, init=0xFFFF, 低字节在前)
+#   查表法：结果与逐位算法完全一致，但每字节由 8 次循环降为 1 次查表。
+#   表在导入时一次性生成(256 项)且只读，多线程访问无竞态。
 # ---------------------------------------------------------------------------
+def _build_crc_table():
+    tbl = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ 0xA001 if (c & 0x0001) else (c >> 1)
+        tbl.append(c)
+    return tbl
+
+
+_CRC_TABLE = _build_crc_table()
+
+
 def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    tbl = _CRC_TABLE
+    for b in data:
+        crc = (crc >> 8) ^ tbl[(crc ^ b) & 0xFF]
+    return crc & 0xFFFF
+
+
+def crc16_modbus_bitwise(data: bytes) -> int:
+    """逐位参考实现（仅供自检比对，验证查表法结果一致）。"""
     crc = 0xFFFF
     for b in data:
         crc ^= b
         for _ in range(8):
-            if crc & 0x0001:
-                crc = (crc >> 1) ^ 0xA001
-            else:
-                crc >>= 1
+            crc = (crc >> 1) ^ 0xA001 if (crc & 0x0001) else (crc >> 1)
     return crc & 0xFFFF
+
+
+# Modbus 异常码 -> 中文说明（RTU / TCP 响应解析共用）
+MODBUS_EXC = {
+    1: "非法功能", 2: "非法数据地址", 3: "非法数据值", 4: "从站设备故障",
+    5: "确认(需等待)", 6: "从站设备忙", 8: "存储奇偶性错误",
+    10: "网关路径不可用", 11: "网关目标无响应",
+}
 
 
 def crc_bytes(data: bytes) -> bytes:
@@ -163,10 +194,6 @@ def tcp_resp_error(resp: bytes, txid: int):
     fc = resp[7] if len(resp) > 7 else 0
     if fc & 0x80:
         exc = resp[8] if len(resp) > 8 else 0
-        MODBUS_EXC = {1: "非法功能", 2: "非法数据地址", 3: "非法数据值",
-                      4: "从站设备故障", 5: "确认(需等待)", 6: "从站设备忙",
-                      8: "存储奇偶性错误", 10: "网关路径不可用",
-                      11: "网关目标无响应"}
         return "设备返回异常 功能码=0x%02X 错误码=0x%02X (%s)" % (
             fc, exc, MODBUS_EXC.get(exc, "未知"))
     return None
@@ -215,22 +242,48 @@ def floor_name(floor: int):
 
 
 # ---------------------------------------------------------------------------
-# 串口读取：首字节阻塞等待，之后以帧间隔(字节间超时)判定一帧结束
+# 串口读取
+#   优先按 Modbus 响应长度定界（读 N 寄存器 = 5+2N 字节；写 = 8 字节），
+#   长度已知时收齐即返回，不再靠"猜字节间隔"，从根本上避免拆包/粘包；
+#   同时保留字节间超时 + 总死线兜底，兼容异常响应(5 字节)与未知功能码。
 # ---------------------------------------------------------------------------
-def read_response(ser, timeout_s, inter_byte_s=0.04):
+def expected_resp_len(req: bytes):
+    """按请求帧推算正常响应字节数；无法确定时返回 None。
+      读寄存器(0x03)：地址1 + 功能码1 + 字节数1 + 数据2N + CRC2 = 5 + 2N
+      写单寄存器(0x06)：回显原请求 = 8
+      异常响应固定 5 字节（地址1 + 功能码|0x80 + 错误码1 + CRC2），单独识别。"""
+    if not req or len(req) < 6:
+        return None
+    fc = req[1] & 0x7F
+    if fc == 0x03:
+        n = (req[4] << 8) | req[5]
+        return 5 + 2 * n if n else None
+    if fc == 0x06:
+        return 8
+    return None
+
+
+def read_response(ser, timeout_s, inter_byte_s=0.04, expected_len=None):
     ser.timeout = timeout_s
     first = ser.read(1)
     if not first:
         return b""
     buf = bytearray(first)
-    ser.timeout = inter_byte_s
+    deadline = time.time() + timeout_s
     while True:
+        if expected_len and len(buf) >= expected_len:
+            break                      # 长度已够：立即返回，避免把下一帧粘进来
+        if len(buf) >= 5 and (buf[1] & 0x80):
+            break                      # 异常响应(5 字节)，提前结束
+        if len(buf) >= 256:
+            break                      # 防御：异常长度保护
+        if time.time() >= deadline:
+            break                      # 总死线：防止无限等待
+        ser.timeout = inter_byte_s
         chunk = ser.read(1)
         if not chunk:
-            break
+            break                      # 字节间隔超时：认为一帧结束
         buf += chunk
-        if len(buf) >= 256:
-            break
     return bytes(buf)
 
 
@@ -243,14 +296,19 @@ def validate_basic(resp: bytes, req: bytes):
         return "无响应（超时）"
     if len(resp) < 5:
         return "响应过短（%d 字节）" % len(resp)
+    if req and resp[0] != req[0]:
+        # 多台设备挂同一条 485 总线时，可据此发现"串到别的从机"
+        return "从机地址不匹配（发送 0x%02X / 收到 0x%02X）" % (req[0], resp[0])
     calc = crc16_modbus(resp[:-2])
     got = resp[-2] | (resp[-1] << 8)
     if calc != got:
-        return "CRC 校验错误"
+        return "CRC 校验错误（计算 0x%04X / 收到 0x%04X）" % (calc, got)
     if resp[1] & 0x80:
-        return "异常响应 错误码 0x%02X" % (resp[2] if len(resp) > 2 else 0)
-    if resp[1] != req[1]:
-        return "功能码不匹配"
+        exc = resp[2] if len(resp) > 2 else 0
+        return "异常响应 功能码 0x%02X 错误码 0x%02X (%s)" % (
+            resp[1], exc, MODBUS_EXC.get(exc, "未知"))
+    if req and resp[1] != req[1]:
+        return "功能码不匹配（发送 0x%02X / 收到 0x%02X）" % (req[1], resp[1])
     return None
 
 
@@ -345,7 +403,7 @@ class BaseConn:
     def write(self, data: bytes):
         raise NotImplementedError
 
-    def read_frame(self, timeout, inter=0.04) -> bytes:
+    def read_frame(self, timeout, inter=0.04, expected_len=None) -> bytes:
         raise NotImplementedError
 
 
@@ -373,8 +431,8 @@ class SerialConn(BaseConn):
     def write(self, data):
         self.ser.write(data)
 
-    def read_frame(self, timeout, inter=0.04):
-        return read_response(self.ser, timeout, inter)
+    def read_frame(self, timeout, inter=0.04, expected_len=None):
+        return read_response(self.ser, timeout, inter, expected_len)
 
 
 class TcpConn(BaseConn):
@@ -402,7 +460,7 @@ class TcpConn(BaseConn):
     def write(self, data):
         self.sock.sendall(data)
 
-    def read_frame(self, timeout, inter=0.05):
+    def read_frame(self, timeout, inter=0.05, expected_len=None):
         self.sock.settimeout(timeout)
         try:
             first = self.sock.recv(1)
@@ -411,8 +469,17 @@ class TcpConn(BaseConn):
         if not first:
             return b""
         buf = bytearray(first)
-        self.sock.settimeout(inter)
+        deadline = time.time() + timeout
         while True:
+            if expected_len and len(buf) >= expected_len:
+                break
+            if len(buf) >= 5 and (buf[1] & 0x80):
+                break
+            if len(buf) >= 256:
+                break
+            if time.time() >= deadline:
+                break
+            self.sock.settimeout(inter)
             try:
                 chunk = self.sock.recv(1)
             except socket.timeout:
@@ -420,8 +487,6 @@ class TcpConn(BaseConn):
             if not chunk:
                 break
             buf += chunk
-            if len(buf) >= 256:
-                break
         return bytes(buf)
 
 
@@ -479,7 +544,7 @@ class MockSerial(BaseConn):
         time.sleep(0.001)
         return out
 
-    def read_frame(self, timeout, inter=0.04):
+    def read_frame(self, timeout, inter=0.04, expected_len=None):
         time.sleep(0.005)
         return bytes(self._buf)
 

@@ -5,7 +5,7 @@
 不弹窗口也能跑（Kivy 用 'mock' 隐藏窗口 + 空输入提供者）。
 覆盖: 字体注册 / 控件齐全 / 未连接禁用 / 间隔钳位 / 状态解析刷新 UI / AGV。
 """
-import os, sys
+import os, sys, time
 
 # Kivy 2.3 已移除 mock 窗口提供者, 这里用真实 SDL2 窗口但不跑主循环,
 # 窗口会一闪而过; 只验证"能不能构建出来"与交互逻辑, 不做视觉校验。
@@ -50,6 +50,7 @@ chk("标题含 MCTC", "MCTC" in app.title, app.title)
 need = ["sp_type", "ent_ip", "ent_port", "ent_addr", "sp_proto", "btn_conn",
         "lbl_conn", "card_sys", "card_run", "card_door", "card_carin",
         "lbl_floor", "btn_read", "sw_autoref", "ent_interval",
+        "ent_timeout", "ent_retries",
         "sw_driver", "sw_cont", "sw_hb", "ent_hb", "lbl_agv",
         "log_label", "statusbar"]
 miss = [n for n in need if not hasattr(app, n)]
@@ -266,6 +267,227 @@ chk("门动画开门度已设置",
     "target=%s door=%s" % (app.view_door._target, res["door"]))
 chk("门状态文字已更新", app.lbl_door_anim.text != "--", app.lbl_door_anim.text)
 chk("方向文字已更新", app.lbl_dir.text != "--", app.lbl_dir.text)
+
+sec("13) 收发线程模型（单线程串行 / 去重 / 重试 / 长度定界）")
+import io
+import queue as _Q
+import tempfile
+import threading
+
+# 11) 里把 send_async 换成了桩函数，这里恢复成真实实现
+try:
+    del app.send_async
+except AttributeError:
+    pass
+app.link, app.proto = "net", "rtu"
+
+
+def wait_for(cond, timeout=2.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+class FakeConn(object):
+    """假连接：按队列返回响应，并记录每次 read_frame 收到的参数。"""
+
+    def __init__(self, replies=None):
+        self.replies = list(replies or [])
+        self.sent = []
+        self.calls = []            # [(expected_len, timeout)]
+        self.resets = 0
+        self._open = True
+        self._lk = threading.Lock()
+
+    def open(self):
+        self._open = True
+
+    def close(self):
+        self._open = False
+
+    def is_open(self):
+        return self._open
+
+    def write(self, data):
+        with self._lk:
+            self.sent.append(bytes(data))
+
+    def read_frame(self, timeout, inter=0.05, expected_len=None):
+        with self._lk:
+            self.calls.append((expected_len, timeout))
+            return self.replies.pop(0) if self.replies else b""
+
+    def reset_buffers(self):
+        with self._lk:
+            self.resets += 1
+
+
+req5 = P.build_read(1, P.REG_SYS, 5)          # 期望响应 = 5 + 2*5 = 15 字节
+body5 = bytes([0x03, 0x0A, 0x00, 0x03, 0x00, 0x01, 0x00, 0x02,
+               0x00, 0x00, 0x00, 0x03])
+resp5 = bytes([0x01]) + body5 + P.crc_bytes(bytes([0x01]) + body5)
+
+# --- 13.1 长度定界：expected_len 必须传到底层 ---
+fc = FakeConn(replies=[resp5])
+app.conn = fc
+app._start_tx_worker()
+app.send_async(req5, "读状态", P.parse_status)
+chk("收发线程已启动", wait_for(lambda: len(fc.calls) >= 1),
+    "线程=%s" % (app._tx_thread is not None))
+chk("RTU 模式 expected_len=15 传到底层", fc.calls[0][0] == 15,
+    "收到 %s" % (fc.calls[0][0],))
+chk("超时按界面毫秒值换算", abs(fc.calls[0][1] - 0.8) < 1e-6,
+    "timeout=%s" % (fc.calls[0][1],))
+
+# --- 13.2 Modbus TCP 模式：expected_len 要加 MBAP 头 ---
+app.proto = "tcp"
+fc2 = FakeConn(replies=[b"\x00\x01\x00\x00\x00\x07\x01\x03\x02\x00\x03\xaa"])
+app.conn = fc2
+app.send_async(req5, "读状态(TCP)", P.parse_status)
+chk("TCP 模式 expected_len=19(=15+4)", wait_for(lambda: len(fc2.calls) >= 1)
+    and fc2.calls[0][0] == 19, "收到 %s" % (fc2.calls[0][0] if fc2.calls else None))
+chk("TCP 帧线上带 MBAP(7B 头)", fc2.sent and fc2.sent[0][:2] == b"\x00\x01",
+    fc2.sent[0][:7].hex(" ") if fc2.sent else "")
+app.proto = "rtu"
+
+# --- 13.3 无响应自动重试 ---
+app.ent_timeout.text, app.ent_retries.text = "120", "2"
+fc3 = FakeConn(replies=[b"", b"", resp5])     # 前两次超时，第三次成功
+app.conn = fc3
+app.send_async(req5, "读状态(重试)", P.parse_status)
+chk("无响应按配置重试至成功", wait_for(lambda: len(fc3.calls) >= 3),
+    "实际尝试 %d 次" % len(fc3.calls))
+chk("重试前清理残留缓冲", fc3.resets >= 2, "reset=%d" % fc3.resets)
+chk("两次超时后第三次拿到响应", fc3.replies == [])
+
+# --- 13.4 重试次数为 0 时只发一次 ---
+fc4 = FakeConn(replies=[b""])
+app.conn = fc4
+app.ent_retries.text = "0"
+app.send_async(req5, "读状态(不重试)", P.parse_status)
+chk("重试 0 次: 只发一次", wait_for(lambda: len(fc4.calls) >= 1)
+    and not wait_for(lambda: len(fc4.calls) >= 2, 0.4),
+    "尝试 %d 次" % len(fc4.calls))
+
+# --- 13.5 周期性任务去重（队列不积压）---
+app.conn = None
+app._stop_tx_worker()
+app._tx_queue = _Q.Queue()
+f_cont = P.build_write(1, P.REG_DOOR_CTRL, P.OPEN_VAL)
+for _ in range(20):
+    app.send_async(f_cont, "持续开门", quiet=True, coalesce="cont_open")
+chk("同键周期任务只留最新 1 条", app._tx_queue.qsize() == 1,
+    "队列 %d" % app._tx_queue.qsize())
+for _ in range(20):
+    app.send_async(f_cont, "AGV心跳", quiet=True, coalesce="agv_hb")
+chk("不同键互不干扰", app._tx_queue.qsize() == 2,
+    "队列 %d" % app._tx_queue.qsize())
+app.send_async(req5, "手动开门", quiet=True)   # 无 coalesce 键 -> 不去重
+chk("无键任务不参与去重", app._tx_queue.qsize() == 3,
+    "队列 %d" % app._tx_queue.qsize())
+
+# --- 13.6 队列积压上限 ---
+app._tx_queue = _Q.Queue()
+for i in range(100):
+    app.send_async(req5, "填充%d" % i, quiet=True)
+app.send_async(req5, "溢出那条", quiet=True)
+chk("积压超上限时丢弃新任务", app._tx_queue.qsize() == 100,
+    "队列 %d" % app._tx_queue.qsize())
+
+# --- 13.7 超时/重试参数钳位与 MQTT 放宽 ---
+app.ent_timeout.text, app.link = "800", "net"
+chk("超时 800ms -> 0.8s", abs(app._io_timeout() - 0.8) < 1e-6,
+    str(app._io_timeout()))
+app.link = "mqtt"
+chk("MQTT 自动放宽到 ≥3s", app._io_timeout() >= 3.0, str(app._io_timeout()))
+app.ent_timeout.text = "5000"
+chk("MQTT 下用户设更大时尊重用户值", abs(app._io_timeout() - 5.0) < 1e-6,
+    str(app._io_timeout()))
+app.link, app.ent_timeout.text = "net", "99999"
+chk("超时上限 20000ms", abs(app._io_timeout() - 20.0) < 1e-6,
+    str(app._io_timeout()))
+app.ent_timeout.text, app.ent_retries.text = "800", "abc"
+chk("重试非法输入回落默认 2", app._retries_now() == 2, str(app._retries_now()))
+app.ent_retries.text = "99"
+chk("重试上限 9", app._retries_now() == 9, str(app._retries_now()))
+app.ent_retries.text = "0"
+chk("重试下限 0", app._retries_now() == 0, str(app._retries_now()))
+app.ent_retries.text = "2"
+
+# --- 13.8 断开清理 ---
+app.conn = FakeConn()
+app._start_tx_worker()
+_th = app._tx_thread
+chk("连接后收发线程存活", _th is not None and _th.is_alive())
+app._teardown_conn()
+chk("断开后队列引用已清空", app._tx_queue is None)
+chk("断开后收发线程已退出", wait_for(lambda: not _th.is_alive(), 2.0))
+
+# --- 13.9 日志导出 ---
+_td = tempfile.mkdtemp(prefix="mctc_log_")
+_orig_dir = M.MCTCApp._export_dir
+M.MCTCApp._export_dir = staticmethod(lambda: _td)
+app._log_plain = ["10:00:00  [TX] 01 03 9C 41 00 05 3F",
+                  "10:00:00  [RX] 01 03 0A 00 03 00 01"]
+app.addr = 1
+_alerts.clear()
+app.export_log()
+_files = [f for f in os.listdir(_td) if f.startswith("mctc_log_")]
+chk("导出生成 txt", len(_files) == 1, str(_files))
+if _files:
+    _fp = os.path.join(_td, _files[0])
+    _raw = io.open(_fp, "rb").read()
+    _txt = io.open(_fp, encoding="utf-8-sig").read()
+    chk("导出带 UTF-8 BOM", _raw[:3] == b"\xef\xbb\xbf", str(_raw[:3]))
+    chk("抬头含协议与站址", "MCTC-KZ-B0S" in _txt and "0x01" in _txt)
+    chk("正文含收发原始帧", "01 03 9C 41 00 05" in _txt)
+chk("导出后提示路径", bool(_alerts) and "mctc_log_" in _alerts[-1])
+app._log_plain = []
+_alerts.clear()
+app.export_log()
+chk("空日志导出给出提示", bool(_alerts) and "没有日志" in _alerts[-1],
+    _alerts[-1] if _alerts else "无提示")
+M.MCTCApp._export_dir = _orig_dir
+
+# --- 13.10 前后台切换 ---
+chk("on_pause 返回 True(不销毁)", app.on_pause() is True)
+app.conn = None
+app.on_resume()                      # 未连接时不应崩
+chk("on_resume 未连接不崩", True)
+
+sec("14) 协议层版本（防与桌面版走偏）")
+chk("含 CRC16 查表法(256 项)", hasattr(P, "_CRC_TABLE")
+    and len(P._CRC_TABLE) == 256, str(len(getattr(P, "_CRC_TABLE", []))))
+chk("查表法与逐位法结果一致",
+    all(P.crc16_modbus(bytes([i])) == P.crc16_modbus_bitwise(bytes([i]))
+        for i in range(256)))
+chk("含响应长度推算 expected_resp_len",
+    P.expected_resp_len(P.build_read(1, P.REG_SYS, 5)) == 15
+    and P.expected_resp_len(P.build_write(1, P.REG_FRONT, 3)) == 8,
+    "读5=%s 写=%s" % (P.expected_resp_len(P.build_read(1, P.REG_SYS, 5)),
+                      P.expected_resp_len(P.build_write(1, P.REG_FRONT, 3))))
+_b = bytes([0x02, 0x03, 0x02, 0x00, 0x03])
+chk("含从机地址校验",
+    "从机地址" in (P.validate_basic(_b + P.crc_bytes(_b),
+                                    P.build_read(1, P.REG_SYS, 1)) or ""),
+    str(P.validate_basic(_b + P.crc_bytes(_b), P.build_read(1, P.REG_SYS, 1))))
+chk("异常码有中文说明", P.MODBUS_EXC.get(2) == "非法数据地址",
+    str(P.MODBUS_EXC.get(2)))
+
+# 强校验：protocol_core.py 必须等于桌面版协议层的抽取结果（跑 sync_protocol.py）
+_src = os.path.join(os.path.dirname(HERE), "protocol_converter_test.py")
+if os.path.exists(_src):
+    _txt = io.open(_src, encoding="utf-8").read()
+    _want = _txt[:_txt.find("\nclass App")]
+    _core = io.open(os.path.join(HERE, "protocol_core.py"), encoding="utf-8").read()
+    _same = _core.endswith(_want)
+    chk("protocol_core 与桌面版协议层完全一致", _same,
+        "一致" if _same else "已漂移！请运行: python sync_protocol.py")
+else:
+    print("  [SKIP] 桌面版 protocol_converter_test.py 不在上级目录，跳过一致性强校验")
 
 sec("结果: %d 通过 / %d 失败" % (npass, nfail))
 sys.exit(1 if nfail else 0)

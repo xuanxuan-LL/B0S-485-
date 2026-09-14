@@ -24,12 +24,26 @@ MCTC-KZ-B0S 电梯测试（安卓版 / Kivy）
   * 1-5 层前门登记、开门/关门、司机功能开关、持续开门信号(200ms)
   * 远程控制使能开关(默认关): 关闭时 App 仅做只读监控, 防止误触下发指令
   * AGV 进入/退出/读状态、心跳自动发送开关 + 间隔(秒)
-  * 通信日志(TX/RX 原始帧 + 解析说明)
+  * 通信日志(TX/RX 原始帧 + 解析说明) + 导出 txt
+  * 响应超时(ms) / 超时重试次数 界面可调
+
+收发模型（与桌面版对齐，2026-09 优化）:
+  * 唯一收发线程 + 任务队列：不再"每条指令起一个线程"，指令严格串行，
+    不会出现多条指令同时压在总线上互相插帧、抢响应。
+  * 周期任务（自动刷新 / 持续开门 / AGV 心跳）按去重键合并，只保留最新的
+    一条待发任务 —— 链路慢时队列不会越积越长，恢复后也不会把一堆过期
+    的"开门"指令一次性灌给电梯。
+  * 按 Modbus 响应长度定界收帧（读 N 寄存器 = 5+2N 字节，写 = 8 字节），
+    不再靠字节间隔猜帧尾，从根本上消除手机侧拆包/粘包。
+  * 无响应自动重试（次数可配），重试前先清残留缓冲，避免错帧。
+  * 切后台保持连接（on_pause/on_resume），回前台自动补一次状态刷新。
 
 协议层来源: protocol_core.py (由 sync_protocol.py 从桌面版自动抽取, 勿手改)
 """
+import io
 import math
 import os
+import queue
 import threading
 import time
 
@@ -55,8 +69,9 @@ from protocol_core import (
     REG_AGV_CTRL, REG_AGV_HB, REG_AGV_STAT, REG_DOOR_CTRL, REG_DRIVER,
     REG_FRONT, REG_SYS,
     RUN_MAP, SYS_MAP, TcpConn,
-    build_read, build_write, decode_carin, parse_agv_status, parse_response,
-    parse_status, rtu_to_tcp_frame, tcp_resp_error, tcp_resp_to_rtu,
+    build_read, build_write, decode_carin, expected_resp_len, parse_agv_status,
+    parse_response, parse_status, rtu_to_tcp_frame, tcp_resp_error,
+    tcp_resp_to_rtu,
 )
 
 import usb_conn          # USB-OTG 串口通道（非安卓环境里自动降级为不可用）
@@ -305,8 +320,9 @@ class MCTCApp(App):
     def build(self):
         self.conn = None
         self.addr = 1
-        self.timeout = 0.8
-        self.mqtt_timeout = 3.0        # MQTT 经公网往返较慢，超时放宽
+        self.timeout = 0.8             # 默认响应超时(秒)，界面按毫秒可调
+        self.mqtt_timeout = 3.0        # MQTT 经公网往返较慢，超时自动放宽到该值
+        self.retries = 2               # 无响应时的自动重试次数（界面可调）
         self.host = "192.168.3.7"
         self.netport = 8887
         self.proto = "rtu"             # rtu | tcp
@@ -316,9 +332,13 @@ class MCTCApp(App):
         self._hb_counter = 0
         self._alive = True
         self.lock = threading.Lock()
+        self._tx_queue = None          # 连接后创建，唯一收发线程从它取任务
+        self._tx_thread = None
+        self._q_lock = threading.Lock()
         self.action_widgets = []       # 连接后才可用的控件
         self.ctrl_widgets = []         # 还需「远程控制使能」才可用的控件
-        self._log_lines = []
+        self._log_lines = []           # 带 Kivy 标记的日志（用于界面显示）
+        self._log_plain = []           # 纯文本日志（用于导出 txt）
 
         root = BoxLayout(orientation="vertical")
         root.add_widget(self._build_tabs())
@@ -329,11 +349,33 @@ class MCTCApp(App):
 
     def on_stop(self):
         self._alive = False
+        self._stop_tx_worker()
         try:
             if self.conn:
                 self.conn.close()
         except Exception:
             pass
+
+    def on_pause(self):
+        """切后台时保住连接与设置。
+
+        Kivy 的 App.on_pause 默认返回 False，安卓会直接销毁 App；本工具
+        需要在切走看一眼再回来时保持连接和输入，所以返回 True 让进程留存。
+        """
+        self.log("App 进入后台（保持连接与设置）", "info")
+        return True
+
+    def on_resume(self):
+        """回到前台：连接若已掉线就回到未连接态，并补一次状态刷新。"""
+        self.log("App 回到前台", "info")
+        if self.conn is not None and not self.conn.is_open():
+            self.log("检测到连接已断开，自动回到未连接状态", "fail")
+            self._teardown_conn()
+            return
+        sw = getattr(self, "sw_autoref", None)
+        if sw is not None and sw.active:
+            # 后台期间 Clock 定时器可能被系统冻结，回来补一次
+            self.read_status()
 
     def _welcome(self):
         self.log("MCTC 电梯测试（安卓版）就绪", "info")
@@ -696,6 +738,41 @@ class MCTCApp(App):
         inner.add_widget(row_auto)
         self.action_widgets.append(self.sw_autoref)
 
+        # 响应超时 / 自动重试（现场 485 偶发丢帧时，一次超时不等于设备故障）
+        row_to = self._row(height=dp(44))
+        lbl_to = Label(text="响应超时", font_name=FONT, font_size=sp(13),
+                       size_hint_x=0.24, halign="left", valign="middle")
+        lbl_to.bind(size=lambda *a: setattr(lbl_to, "text_size", (a[0].width, None)))
+        row_to.add_widget(lbl_to)
+        self.ent_timeout = TextInput(text="800", font_name=FONT, font_size=sp(14),
+                                     size_hint_x=0.24, multiline=False,
+                                     input_filter="int",
+                                     padding=[dp(8), dp(8), 0, 0])
+        row_to.add_widget(self.ent_timeout)
+        lbl_ms = Label(text="ms  重试", font_name=FONT, font_size=sp(12),
+                       size_hint_x=0.22, halign="left", valign="middle",
+                       color=(0.35, 0.35, 0.35, 1))
+        lbl_ms.bind(size=lambda *a: setattr(lbl_ms, "text_size", (a[0].width, None)))
+        row_to.add_widget(lbl_ms)
+        self.ent_retries = TextInput(text="2", font_name=FONT, font_size=sp(14),
+                                     size_hint_x=0.16, multiline=False,
+                                     input_filter="int",
+                                     padding=[dp(8), dp(8), 0, 0])
+        row_to.add_widget(self.ent_retries)
+        lbl_c = Label(text="次", font_name=FONT, font_size=sp(12),
+                      size_hint_x=0.14, halign="left", valign="middle",
+                      color=(0.35, 0.35, 0.35, 1))
+        row_to.add_widget(lbl_c)
+        inner.add_widget(row_to)
+
+        tip_to = Label(text="超时 100–20000ms，重试 0–9 次；MQTT 云走公网，"
+                            "超时自动放宽到 ≥3 秒",
+                       font_name=FONT, font_size=sp(11), size_hint_y=None,
+                       height=dp(30), color=(0.4, 0.4, 0.4, 1),
+                       halign="left", valign="middle")
+        tip_to.bind(size=lambda *a: setattr(tip_to, "text_size", (a[0].width, None)))
+        inner.add_widget(tip_to)
+
         return self._scrollable(inner)
 
     def _sync_floor(self, *a):
@@ -847,6 +924,9 @@ class MCTCApp(App):
         row_btn.add_widget(Button(text="清空日志", font_name=FONT,
                                   font_size=sp(14),
                                   on_release=lambda *a: self.clear_log()))
+        row_btn.add_widget(Button(text="导出日志", font_name=FONT,
+                                  font_size=sp(14),
+                                  on_release=lambda *a: self.export_log()))
         inner.add_widget(row_btn)
 
         sv = ScrollView(do_scroll_x=False, size_hint_y=1)
@@ -1023,9 +1103,13 @@ class MCTCApp(App):
                 conn.open()
                 self.conn = conn
                 label = "%s:%d" % (self.host, self.netport)
+            self._start_tx_worker()      # 连上后才启动收发线程
             Clock.schedule_once(lambda dt: self._on_connected(label), 0)
         except Exception as e:
-            Clock.schedule_once(lambda dt: self._on_connect_failed(str(e)), 0)
+            # 注意：Python 3 在 except 块结束时会隐式 del e，lambda 延迟执行时
+            # 已经取不到 e（会抛 NameError），必须先固化成 msg 再传进去。
+            msg = str(e)
+            Clock.schedule_once(lambda dt: self._on_connect_failed(msg), 0)
 
     def _on_connected(self, label):
         self.lbl_conn.text = "● 已连接 %s" % label
@@ -1063,12 +1147,13 @@ class MCTCApp(App):
                        "IP/端口是否正确、服务器是否为 TCP Server 模式" % err)
 
     def _watch_usb(self, dt):
-        """拔线看门狗：USB 设备断开时自动停止连接。"""
-        if self.conn is None or not self.conn.is_open():
-            self.log("检测到 USB 串口已断开，自动断开连接", "fail")
-            self._cancel_usb_watch()
-            self._on_disconnected()
-        return True
+        """拔线看门狗：USB 设备断开时自动收尾（返回 False 停掉该定时器）。"""
+        if self.conn is not None and self.conn.is_open():
+            return True
+        self.log("检测到 USB 串口已断开，自动断开连接", "fail")
+        self._cancel_usb_watch()
+        self._teardown_conn()      # 必须走这里：要停收发线程并清空 conn
+        return False
 
     def _cancel_usb_watch(self):
         ev = getattr(self, "_usb_event", None)
@@ -1080,14 +1165,22 @@ class MCTCApp(App):
             self._usb_event = None
 
     def _disc_worker(self):
+        self._teardown_conn()
+
+    def _teardown_conn(self):
+        """关连接 + 停收发线程。可从任意线程调用，UI 更新切回主线程。"""
+        self._stop_tx_worker()
         try:
             if self.conn:
                 self.conn.close()
         except Exception:
             pass
         self.conn = None
+        Clock.schedule_once(lambda dt: self._after_closed(), 0)
+
+    def _after_closed(self):
         self._cancel_usb_watch()
-        Clock.schedule_once(lambda dt: self._on_disconnected(), 0)
+        self._on_disconnected()
 
     def _on_disconnected(self):
         self.lbl_conn.text = "● 未连接"
@@ -1147,12 +1240,98 @@ class MCTCApp(App):
                  "  → 请在「控制」页打开「允许下发控制指令」" % what, "fail")
         return False
 
-    # ---- 指令发送（后台线程，UI 更新切回主线程）----
-    def send_async(self, frame, label, parser=None, quiet=False):
-        threading.Thread(target=self._send_worker,
-                         args=(frame, label, parser, quiet), daemon=True).start()
+    # ---- 超时 / 重试参数（界面可调，每次收发时读取，改完立即生效）----
+    def _io_timeout(self):
+        """单次等待响应的秒数。界面单位毫秒；MQTT 走公网自动放宽到 ≥3s。"""
+        ms = self._interval_of(self.ent_timeout.text, self.timeout * 1000.0,
+                               100.0, 20000.0)
+        secs = ms / 1000.0
+        if getattr(self, "link", "net") == "mqtt":
+            secs = max(secs, self.mqtt_timeout)
+        return secs
 
-    def _send_worker(self, frame, label, parser, quiet):
+    def _retries_now(self):
+        return int(self._interval_of(self.ent_retries.text, 2.0, 0.0, 9.0))
+
+    # ---- 收发线程生命周期 ----
+    def _start_tx_worker(self):
+        self._stop_tx_worker()
+        q = queue.Queue()
+        with self._q_lock:
+            self._tx_queue = q
+        self._tx_thread = threading.Thread(target=self._tx_loop, args=(q,),
+                                           daemon=True)
+        self._tx_thread.start()
+
+    def _stop_tx_worker(self):
+        """停掉收发线程（不阻塞 UI：投个哨兵即可，线程最多 0.2s 后自行退出）。"""
+        q, self._tx_queue = self._tx_queue, None
+        if q is not None:
+            try:
+                q.put(None)
+            except Exception:
+                pass
+        self._tx_thread = None
+
+    def _tx_loop(self, q):
+        """唯一的收发线程：串行执行队列里的任务。
+
+        为什么不像以前那样"每条指令起一个线程"：
+          Android 上持续开门是 5 条/秒，再叠加自动刷新与 AGV 心跳，
+          线程数会无上限地涨；更糟的是多个线程同时读写同一个串口/TCP 连接，
+          收发会互相插帧，响应还可能被别的线程读走 —— 现场表现为"偶发串帧/丢响应"。
+          单线程串行后，同一时刻永远只有一条指令在总线上。
+        """
+        while self._alive:
+            try:
+                task = q.get(timeout=0.2)
+            except queue.Empty:
+                if q is not self._tx_queue:
+                    break
+                continue
+            if task is None or q is not self._tx_queue:
+                break
+            try:
+                self._do_send(*task)
+            except Exception as e:
+                self.log("收发异常: %s" % e, "fail")
+
+    # ---- 指令发送（投递到队列，UI 更新切回主线程）----
+    def send_async(self, frame, label, parser=None, quiet=False,
+                   coalesce=None, retries=None):
+        """把一条收发任务排入队列。
+
+        coalesce：周期任务的去重键。同一个键的旧任务若还没发出去就直接丢掉
+          （只保留最新一条）。自动刷新 / 持续开门 / AGV 心跳都用它 ——
+          链路慢的时候队列不会越积越长，恢复后也不会把一堆过期指令
+          一次性灌给电梯（对"持续开门"这种写指令尤其重要）。
+        """
+        q = self._tx_queue
+        if q is None:
+            self.log("尚未连接，请先点击“连接”", "fail")
+            return
+        with self._q_lock:
+            if q is not self._tx_queue:
+                return
+            if coalesce is not None:
+                kept = []
+                while True:
+                    try:
+                        it = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if it is not None and it[5] == coalesce:
+                        continue                  # 丢掉同键旧任务
+                    kept.append(it)
+                for it in kept:
+                    q.put(it)
+            if q.qsize() >= 100:                  # 兜底：极端情况不无限堆积
+                self.log("发送队列积压 >100，已丢弃「%s」" % label, "fail")
+                return
+            q.put((frame, label, parser, quiet, retries, coalesce))
+
+    def _do_send(self, frame, label, parser, quiet, retries=None,
+                 coalesce=None):
         if self.conn is None or not self.conn.is_open():
             self.log("尚未连接，请先点击“连接”", "fail")
             return
@@ -1164,17 +1343,36 @@ class MCTCApp(App):
                 self._txid = (self._txid + 1) & 0xFFFF
                 txid = self._txid
             wire = rtu_to_tcp_frame(frame, txid)
-        with self.lock:
+        # 期望响应长度：已知则按长度精确收帧（不再靠帧间隙猜边界，避免粘包/截断）。
+        # Modbus TCP 响应 = 等效 RTU 帧 + 4（MBAP 头 7 字节 - 站址 1 - CRC 2）。
+        exp_len = expected_resp_len(frame)
+        if exp_len and tcp_mode:
+            exp_len += 4
+        if retries is None:
+            retries = self._retries_now()
+        timeout = self._io_timeout()
+        attempt = 0
+        resp = b""
+        while True:
             try:
+                if attempt:
+                    # 重试前清掉上一轮残帧，避免把上一轮的尾巴当本轮响应
+                    reset = getattr(self.conn, "reset_buffers", None)
+                    if callable(reset):
+                        reset()
                 self.conn.write(wire)
                 time.sleep(0.01)
-                # MQTT 经公网往返较慢，超时放宽，否则会把慢响应误判成无响应
-                to = (self.mqtt_timeout if getattr(self, "link", "net") == "mqtt"
-                      else self.timeout)
-                resp = self.conn.read_frame(to, 0.05)
+                resp = self.conn.read_frame(timeout, 0.05, exp_len)
             except Exception as e:
                 self.log("%s → 收发异常: %s" % (label, e), "fail")
                 return
+            attempt += 1
+            if resp or attempt > retries:
+                break
+            self.log("%s → 无响应，重试 %d/%d…" % (label, attempt, retries),
+                     "info")
+        if attempt > 1 and resp:
+            self.log("%s 第 %d 次尝试收到响应" % (label, attempt), "info")
         if tcp_mode and resp:
             merr = tcp_resp_error(resp, txid)
             if merr:
@@ -1296,7 +1494,7 @@ class MCTCApp(App):
             return
         if self.conn and self.conn.is_open():
             self.send_async(build_write(self.addr, REG_DOOR_CTRL, OPEN_VAL),
-                            "持续开门", quiet=True)
+                            "持续开门", quiet=True, coalesce="cont_open")
         Clock.schedule_once(self._cont_open_tick, 0.2)
 
     def on_agv_hb_toggle(self, sw, active):
@@ -1320,13 +1518,15 @@ class MCTCApp(App):
             frame = build_write(self.addr, REG_AGV_HB, self._hb_counter)
             self.send_async(frame,
                             "AGV心跳(0x9CA6=0x%04X)" % self._hb_counter,
-                            quiet=True)
+                            quiet=True, coalesce="agv_hb")
         Clock.schedule_once(self._heartbeat_tick, secs)
 
     # ---- 具体指令 ----
     def read_status(self):
+        # 自动刷新与手动点按共用一个去重键：链路慢时不会堆一串待发的读指令
         self.send_async(build_read(self.addr, REG_SYS, 5),
-                        "一键读取电梯状态(0x9C41×5)", parse_status)
+                        "一键读取电梯状态(0x9C41×5)", parse_status,
+                        coalesce="read_status")
 
     def front_call(self, floor):
         if not self._ctrl_allowed("登记 %d 楼前门" % floor):
@@ -1380,14 +1580,65 @@ class MCTCApp(App):
         ts = time.strftime("%H:%M:%S")
         line = "[color=%s]%s  %s[/color]" % (color, ts, esc(text))
         self._log_lines.append(line)
+        self._log_plain.append("%s  [%s] %s" % (ts, tag.upper(), text))
         if len(self._log_lines) > 400:
             self._log_lines = self._log_lines[-400:]
+        if len(self._log_plain) > 400:
+            self._log_plain = self._log_plain[-400:]
         self.log_label.text = "\n".join(self._log_lines)
         self._update_statusbar(None)
 
     def clear_log(self):
         self._log_lines = []
+        self._log_plain = []
         self.log_label.text = ""
+
+    @staticmethod
+    def _export_dir():
+        """挑一个可写目录存日志。
+
+        安卓：优先应用专属外部目录（Android 10+ 无需存储权限即可写）；
+        Windows/调试：用程序所在目录，找不到再退回用户目录。
+        """
+        cands = []
+        if platform == "android":
+            try:
+                from android.storage import primary_external_storage_path
+                cands.append(primary_external_storage_path())
+            except Exception:
+                pass
+            cands += ["/sdcard/Download", "/sdcard"]
+        cands += [BASE_DIR, os.path.expanduser("~"), os.getcwd()]
+        for d in cands:
+            try:
+                if d and os.path.isdir(d) and os.access(d, os.W_OK):
+                    return d
+            except Exception:
+                continue
+        return BASE_DIR
+
+    def export_log(self):
+        """把通信日志导出成 txt（带时间/连接/站址抬头，便于留证）。"""
+        if not self._log_plain:
+            self.alert("当前没有日志可导出")
+            return
+        path = os.path.join(self._export_dir(),
+                            "mctc_log_%s.txt" % time.strftime("%Y%m%d_%H%M%S"))
+        head = ("MCTC-KZ-B0S 通信日志\n"
+                "导出时间: %s\n连接: %s\n站址: 0x%02X\n传输协议: %s\n%s\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                   getattr(self, "_conn_text", "未连接"), self.addr,
+                   "Modbus TCP 网关" if self.use_tcp_mbap() else "Modbus RTU 透传",
+                   "-" * 46))
+        try:
+            with io.open(path, "w", encoding="utf-8-sig") as f:
+                f.write(head + "\n".join(self._log_plain) + "\n")
+        except Exception as e:
+            self.log("日志导出失败: %s" % e, "fail")
+            self.alert("日志导出失败：\n%s" % e)
+            return
+        self.log("日志已导出: %s" % path, "ok")
+        self.alert("日志已导出：\n%s" % path)
 
     def _update_statusbar(self, conn_text):
         if conn_text is not None:

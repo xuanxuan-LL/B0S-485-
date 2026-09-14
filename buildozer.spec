@@ -13,9 +13,9 @@ source.exclude_dirs = tests, bin, .buildozer, __pycache__
 source.include_patterns = assets/*,res/xml/*
 
 # ---- 版本 ----
-version = 1.0.0
+version = 1.1.0
 # 版本号(整数, 每次发版递增)
-numeric_version = 1
+numeric_version = 2
 
 # ---- 依赖 ----
 # 三种连接模式所需依赖：

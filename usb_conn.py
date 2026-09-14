@@ -190,8 +190,14 @@ class UsbConn(object):
             raise RuntimeError("USB 串口未打开")
         self.port.write(data)
 
-    def read_frame(self, timeout=0.6, inter=0.04):
-        """读一帧：首字节阻塞等 timeout 秒，之后以字节间超时判定帧结束。"""
+    def read_frame(self, timeout=0.6, inter=0.04, expected_len=None):
+        """读一帧。
+
+        expected_len 非空时按 Modbus 响应的确定性长度定界：收齐即返回，
+        不再靠"猜字节间隔"，从根本上避免手机→USB 转换器之间的拆包/粘包
+        （与 protocol_core.read_response、TcpConn / MqttConn 行为一致）。
+        同时保留字节间超时 + 总死线 + 异常响应(5 字节)提前结束三重兜底。
+        """
         if not self.is_open():
             return b""
         p = self.port
@@ -200,15 +206,21 @@ class UsbConn(object):
         if not first:
             return b""
         buf = bytearray(first)
-        p.timeout = inter
-        deadline = time.time() + 0.5
-        while len(buf) < 256:
+        deadline = time.time() + timeout
+        while True:
+            if expected_len and len(buf) >= expected_len:
+                break                       # 长度已够：立即返回，不粘下一帧
+            if len(buf) >= 5 and (buf[1] & 0x80):
+                break                       # 异常响应固定 5 字节
+            if len(buf) >= 256:
+                break                       # 防御：异常长度保护
+            if time.time() >= deadline:
+                break                       # 总死线：防止无限等待
+            p.timeout = inter
             chunk = p.read(1)
             if not chunk:
-                break
+                break                       # 字节间隔超时：认为一帧结束
             buf += chunk
-            if time.time() > deadline:
-                break
         return bytes(buf)
 
     def reset_buffers(self):

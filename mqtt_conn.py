@@ -46,7 +46,7 @@ except Exception as _e:          # 未安装 / 未打包进 APK 时降级
     MQTT_OK = False
     MQTT_ERR = "%s: %s" % (type(_e).__name__, _e)
 
-from protocol_core import BaseConn, crc16_modbus
+from protocol_core import BaseConn, crc16_modbus, expected_resp_len
 
 __all__ = ["MqttConn", "MQTT_OK", "MQTT_ERR", "expected_resp_len"]
 
@@ -72,17 +72,8 @@ def _new_client(client_id):
         return mqtt.Client(client_id=client_id)
 
 
-def expected_resp_len(req: bytes) -> int:
-    """按 Modbus-RTU 请求推算响应长度；推算不出来时返回 0。"""
-    if not req or len(req) < 2:
-        return 0
-    fc = req[1]
-    if fc == 0x03 and len(req) >= 6:        # 读保持寄存器
-        cnt = (req[4] << 8) | req[5]
-        return 5 + 2 * cnt
-    if fc in (0x06, 0x10):                  # 写单/写多寄存器 -> 8 字节回显
-        return 8
-    return 0
+# expected_resp_len 直接复用 protocol_core 的实现（单一来源，勿在此重复定义）：
+# 两条链路（串口/网口/云）必须用同一套长度推算规则，否则一处改了另一处会走偏。
 
 
 class MqttConn(BaseConn):
